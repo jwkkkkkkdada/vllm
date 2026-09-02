@@ -193,6 +193,38 @@ class BaseFrontendArgs:
     """
     fingerprint_value: str | None = None
     """Literal fingerprint string used when ``--fingerprint-mode=custom``."""
+    responses_store_disk_path: str | None = None
+    """SQLite path for the Responses API token store. When omitted, vLLM uses
+    a process-local file in the system temporary directory. This setting takes
+    effect when ``VLLM_ENABLE_RESPONSES_API_STORE=1``."""
+    responses_store_memory_capacity_mb: int = 512
+    """Maximum in-memory Responses token-store capacity in MiB."""
+    responses_store_disk_capacity_mb: int = 4096
+    """Maximum on-disk Responses token-store capacity in MiB."""
+    responses_store_memory_low_watermark: float = 0.6
+    """Memory usage ratio cleanup should target after crossing the high
+    watermark."""
+    responses_store_memory_high_watermark: float = 0.8
+    """Memory usage ratio that triggers pressure-based cleanup."""
+    responses_store_disk_low_watermark: float = 0.7
+    """Disk usage ratio cleanup should target after crossing the high
+    watermark."""
+    responses_store_disk_high_watermark: float = 0.9
+    """Disk usage ratio that triggers pressure-based cleanup."""
+    responses_store_memory_ttl_seconds: int = 300
+    """Idle lifetime of an in-memory token copy in seconds. Set to 0 to
+    disable TTL-based memory cleanup."""
+    responses_store_disk_ttl_seconds: int = 3600
+    """Idle lifetime of an on-disk token copy in seconds. Set to 0 to disable
+    TTL-based disk cleanup."""
+    responses_store_cleanup_interval_seconds: float = 30.0
+    """Interval between Responses token-store cleanup runs."""
+    responses_store_cleanup_max_candidates: int = 128
+    """Maximum number of candidates processed per storage tier and cleanup
+    run."""
+    responses_store_cleanup_max_bytes_mb: int = 512
+    """Maximum planned bytes reclaimed per storage tier and cleanup run, in
+    MiB."""
 
     @classmethod
     def _customize_cli_kwargs(
@@ -447,6 +479,37 @@ def validate_parsed_serve_args(args: argparse.Namespace):
             "Error: --enable-per-request-metrics requires engine statistics "
             "logging; remove --disable-log-stats to enable per-request metrics."
         )
+
+    for name in (
+        "responses_store_memory_capacity_mb",
+        "responses_store_disk_capacity_mb",
+        "responses_store_cleanup_max_candidates",
+        "responses_store_cleanup_max_bytes_mb",
+    ):
+        if getattr(args, name) <= 0:
+            flag = name.replace("_", "-")
+            raise ValueError(f"Error: --{flag} must be greater than 0.")
+
+    for name in (
+        "responses_store_memory_ttl_seconds",
+        "responses_store_disk_ttl_seconds",
+    ):
+        if getattr(args, name) < 0:
+            raise ValueError(f"Error: --{name.replace('_', '-')} must be non-negative.")
+
+    if args.responses_store_cleanup_interval_seconds <= 0:
+        raise ValueError(
+            "Error: --responses-store-cleanup-interval-seconds must be greater than 0."
+        )
+
+    for tier in ("memory", "disk"):
+        low = getattr(args, f"responses_store_{tier}_low_watermark")
+        high = getattr(args, f"responses_store_{tier}_high_watermark")
+        if not 0 <= low < high <= 1:
+            raise ValueError(
+                f"Error: Responses store {tier} watermarks must satisfy "
+                "0 <= low < high <= 1."
+            )
 
     if args.data_parallel_multi_port_external_lb:
         from vllm.entrypoints.launchers.dp_supervisor import (

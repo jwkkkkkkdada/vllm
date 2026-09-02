@@ -8,7 +8,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Se
 from contextlib import AsyncExitStack
 from copy import copy
 from http import HTTPStatus
-from typing import Any, Final
+from typing import TYPE_CHECKING, Any, Final
 
 from fastapi import Request
 from openai.types.responses import (
@@ -102,6 +102,9 @@ from vllm.tokenizers import TokenizerLike
 from vllm.utils import random_uuid
 from vllm.utils.collection_utils import as_list
 
+if TYPE_CHECKING:
+    from vllm.entrypoints.openai.responses.store.base import SessionStore
+
 logger = init_logger(__name__)
 
 
@@ -163,6 +166,7 @@ class OpenAIServingResponses(GenerateBaseServing):
         enable_force_include_usage: bool = False,
         enable_log_outputs: bool = False,
         default_chat_template_kwargs: dict[str, Any] | None = None,
+        session_store: "SessionStore | None" = None,
     ) -> None:
         super().__init__(
             engine_client=engine_client,
@@ -176,6 +180,7 @@ class OpenAIServingResponses(GenerateBaseServing):
         self.chat_template_content_format: Final = chat_template_content_format
         self.chat_template_kwargs = default_chat_template_kwargs or {}
         self.enable_log_outputs = enable_log_outputs
+        self.session_store = session_store
 
         # Set up the unified parser - either a unified parser or fall back to
         # separate parsers accessed through the parser interface
@@ -513,6 +518,7 @@ class OpenAIServingResponses(GenerateBaseServing):
                 trace_headers=trace_headers,
                 session_id=session_id,
                 reasoning_parser_kwargs=reasoning_parser_kwargs,
+                persist_token_ids=bool(request.store and self.session_store),
             )
             generators.append(generator)
 
@@ -665,6 +671,7 @@ class OpenAIServingResponses(GenerateBaseServing):
         trace_headers: Mapping[str, str] | None = None,
         session_id: str | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
+        persist_token_ids: bool = False,
     ):
         max_model_len = self.model_config.max_model_len
 
@@ -694,6 +701,23 @@ class OpenAIServingResponses(GenerateBaseServing):
 
             async for res in generator:
                 context.append_output(res)
+                if persist_token_ids and self.session_store is not None and res.outputs:
+                    delta_token_ids = as_list(res.outputs[0].token_ids)
+                    if delta_token_ids:
+                        try:
+                            await self.session_store.save(
+                                session_id or request_id,
+                                request_id,
+                                delta_token_ids,
+                            )
+                        except Exception:
+                            # Token persistence is auxiliary and must not fail
+                            # an otherwise healthy generation request.
+                            logger.exception(
+                                "Failed to persist Responses token IDs for %s",
+                                request_id,
+                            )
+                            persist_token_ids = False
                 # NOTE(woosuk): The stop condition is handled by the engine.
                 yield context
 
