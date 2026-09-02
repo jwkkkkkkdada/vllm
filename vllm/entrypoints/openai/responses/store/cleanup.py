@@ -92,9 +92,13 @@ class PeriodicSessionStoreCleanup:
         self._store = store
         self._config = config
         self._memory_policy = EvictionPolicy(StorageTier.MEMORY)
-        self._disk_policy = EvictionPolicy(StorageTier.DISK)
         self._memory_executor = MemoryEvictionExecutor(store)
-        self._disk_executor = DiskEvictionExecutor(store)
+        self._disk_policy = (
+            EvictionPolicy(StorageTier.DISK) if store.disk_enabled else None
+        )
+        self._disk_executor = (
+            DiskEvictionExecutor(store) if store.disk_enabled else None
+        )
         self._run_lock = asyncio.Lock()
         self._task: asyncio.Task[None] | None = None
         self._last_result: CleanupRunResult | None = None
@@ -134,34 +138,41 @@ class PeriodicSessionStoreCleanup:
 
             records = await self._store.list()
             scanned_session_count = len(records)
-            memory_used_bytes, disk_used_bytes = await asyncio.gather(
-                self._store.memory_used_bytes(),
-                self._store.disk_used_bytes(),
-            )
-
             memory_candidates = self._memory_policy.build_sorted_candidates(
                 records,
                 started_at,
             )
-            disk_candidates = self._disk_policy.build_sorted_candidates(
-                records,
-                started_at,
-            )
+
+            if self._store.disk_enabled:
+                memory_used_bytes, disk_used_bytes = await asyncio.gather(
+                    self._store.memory_used_bytes(),
+                    self._store.disk_used_bytes(),
+                )
+                assert self._disk_policy is not None
+                disk_candidates = self._disk_policy.build_sorted_candidates(
+                    records,
+                    started_at,
+                )
+                disk_decision = self._disk_policy.evaluate_trigger(
+                    disk_candidates,
+                    disk_used_bytes,
+                    self._config.disk.watermarks,
+                )
+                disk_pressure = self._build_disk_pressure(
+                    records=records,
+                    candidates=disk_candidates,
+                    decision=disk_decision,
+                )
+            else:
+                memory_used_bytes = await self._store.memory_used_bytes()
+                disk_candidates = ()
+                disk_decision = self._disabled_disk_decision()
+                disk_pressure = self._disabled_disk_pressure()
 
             memory_decision = self._memory_policy.evaluate_trigger(
                 memory_candidates,
                 memory_used_bytes,
                 self._config.memory.watermarks,
-            )
-            disk_decision = self._disk_policy.evaluate_trigger(
-                disk_candidates,
-                disk_used_bytes,
-                self._config.disk.watermarks,
-            )
-            disk_pressure = self._build_disk_pressure(
-                records=records,
-                candidates=disk_candidates,
-                decision=disk_decision,
             )
 
             memory_result = await self._cleanup_memory(
@@ -217,6 +228,7 @@ class PeriodicSessionStoreCleanup:
             selection=selection,
             context=context,
             now=now,
+            force=(decision.high_watermark_reached and not self._store.disk_enabled),
         )
 
     async def _cleanup_disk(
@@ -228,6 +240,8 @@ class PeriodicSessionStoreCleanup:
         if not decision.should_evict:
             return None
 
+        assert self._disk_policy is not None
+        assert self._disk_executor is not None
         assert decision.trigger_reason is not None
         selection = self._disk_policy.select_candidates(
             candidates=candidates,
@@ -332,4 +346,27 @@ class PeriodicSessionStoreCleanup:
             required_free_bytes=required_free_bytes,
             blocked_bytes=blocked_bytes,
             pressure_blocked=(decision.high_watermark_reached and blocked_bytes > 0),
+        )
+
+    @staticmethod
+    def _disabled_disk_decision() -> EvictionTriggerDecision:
+        return EvictionTriggerDecision(
+            should_evict=False,
+            has_expired_candidates=False,
+            high_watermark_reached=False,
+            used_bytes=0,
+            target_used_bytes=None,
+            trigger_reason=None,
+        )
+
+    @staticmethod
+    def _disabled_disk_pressure() -> DiskPressureResult:
+        return DiskPressureResult(
+            total_used_bytes=0,
+            protected_used_bytes=0,
+            reclaimable_used_bytes=0,
+            unavailable_used_bytes=0,
+            required_free_bytes=0,
+            blocked_bytes=0,
+            pressure_blocked=False,
         )

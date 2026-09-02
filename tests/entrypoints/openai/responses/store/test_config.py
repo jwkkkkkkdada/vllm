@@ -20,10 +20,19 @@ def test_default_cli_config() -> None:
     config = ResponsesStoreConfig.from_cli_args(_parse_args())
 
     assert not config.enabled
+    assert config.disk_enabled
     assert config.memory_capacity_bytes == 512 * 1024 * 1024
     assert config.disk_capacity_bytes == 4096 * 1024 * 1024
     assert config.memory_ttl_seconds == 300
     assert config.disk_ttl_seconds == 3600
+
+
+def test_cli_config_can_disable_disk_store() -> None:
+    config = ResponsesStoreConfig.from_cli_args(
+        _parse_args("--no-responses-store-disk-enabled")
+    )
+
+    assert not config.disk_enabled
 
 
 def test_cli_config_converts_units_and_builds_cleanup_config(tmp_path) -> None:

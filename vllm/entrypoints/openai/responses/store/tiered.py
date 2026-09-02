@@ -17,12 +17,12 @@ from .metrics import ResponseStoreMetrics
 
 
 class TieredSessionStore(SessionStore):
-    """Memory 主存储 + SQLite 二级恢复层。"""
+    """Memory 主存储，以及可选的 SQLite 二级恢复层。"""
 
     def __init__(
         self,
         memory_store: MemorySessionStore,
-        disk_store: SQLiteSessionStore,
+        disk_store: SQLiteSessionStore | None,
         num_shards: int = 64,
     ) -> None:
         if num_shards <= 0:
@@ -30,9 +30,12 @@ class TieredSessionStore(SessionStore):
 
         self._memory = memory_store
         self._disk = disk_store
+        self._metrics = (
+            disk_store.metrics if disk_store is not None else ResponseStoreMetrics()
+        )
 
-        # Memory 自己的锁只能保证单层操作；Tiered 的 save/get/delete 包含
-        # 多个 await 和跨层操作，因此同一 session 还需要一层复合操作锁。
+        # Tiered 的 save/get/delete 包含多个 await 和跨层操作，
+        # 因此同一 session 需要一层复合操作锁。
         self._locks = [asyncio.Lock() for _ in range(num_shards)]
 
     async def save(
@@ -41,6 +44,10 @@ class TieredSessionStore(SessionStore):
         response_id: str,
         delta_token_ids: list[int],
     ) -> None:
+        if self._disk is None:
+            await self._memory.save(session_id, response_id, delta_token_ids)
+            return
+
         async with self._get_lock(session_id):
             # Session 可能已从 Memory 淘汰，只存在于 Disk。此时先恢复完整
             # 历史，再追加本轮 delta；正常 Memory hit 路径不会访问 SQLite。
@@ -60,6 +67,9 @@ class TieredSessionStore(SessionStore):
                 await self._disk.save(session_id, response_id, delta_token_ids)
 
     async def get(self, session_id: str) -> list[int] | None:
+        if self._disk is None:
+            return await self._memory.get(session_id)
+
         async with self._get_lock(session_id):
             token_ids = await self._memory.get(session_id)
             if token_ids is not None:
@@ -79,6 +89,9 @@ class TieredSessionStore(SessionStore):
         """
         对外 exists：Memory 有则 True；否则只有 Disk 最新版本完整可恢复时 True。
         """
+        if self._disk is None:
+            return await self._memory.exists(session_id)
+
         async with self._get_lock(session_id):
             if await self._memory.exists(session_id):
                 return True
@@ -90,12 +103,18 @@ class TieredSessionStore(SessionStore):
 
         Memory 容量淘汰不是 Tiered.delete()：淘汰只应删除 Memory 层对象。
         """
+        if self._disk is None:
+            return await self._memory.delete(session_id)
+
         async with self._get_lock(session_id):
             memory_deleted = await self._memory.delete(session_id)
             disk_deleted = await self._disk.delete(session_id)
             return memory_deleted or disk_deleted
 
     async def list(self) -> list[SessionState]:
+        if self._disk is None:
+            return await self._memory.list()
+
         memory_states, disk_states = await asyncio.gather(
             self._memory.list(), self._disk.list()
         )
@@ -132,6 +151,15 @@ class TieredSessionStore(SessionStore):
                     self._map_memory_store_status(candidate_status),
                 )
 
+            if self._disk is None:
+                return await self._evict_memory_without_disk(
+                    session_id=session_id,
+                    expected_response_id=expected_response_id,
+                    expected_updated_at=expected_updated_at,
+                    now=now,
+                    force=force,
+                )
+
             disk_result = await self._disk.ensure_eviction_copy(
                 session_id=session_id,
                 expected_response_id=expected_response_id,
@@ -146,11 +174,13 @@ class TieredSessionStore(SessionStore):
                     MemoryEvictionStatus.PERSISTENCE_PENDING,
                 )
             if disk_result.status is DiskCopyStatus.FAILED:
-                return self._eviction_result(
-                    session_id,
-                    expected_response_id,
-                    MemoryEvictionStatus.PERSISTENCE_FAILED,
-                )
+                if not force:
+                    return self._eviction_result(
+                        session_id,
+                        expected_response_id,
+                        MemoryEvictionStatus.PERSISTENCE_FAILED,
+                    )
+                eviction_status = MemoryEvictionStatus.FORCE_EVICTED
             if disk_result.status is DiskCopyStatus.RESPONSE_CHANGED:
                 return self._eviction_result(
                     session_id,
@@ -163,44 +193,12 @@ class TieredSessionStore(SessionStore):
                     expected_response_id,
                     MemoryEvictionStatus.VERSION_CHANGED,
                 )
-            if disk_result.status is DiskCopyStatus.EXPIRED:
-                memory_state = await self._memory.get_state_for_eviction(session_id)
-                if memory_state is None:
-                    return self._eviction_result(
-                        session_id,
-                        expected_response_id,
-                        MemoryEvictionStatus.NOT_FOUND,
-                    )
-                if memory_state.response_id != expected_response_id:
-                    return self._eviction_result(
-                        session_id,
-                        expected_response_id,
-                        MemoryEvictionStatus.RESPONSE_CHANGED,
-                    )
-                if memory_state.updated_at != expected_updated_at:
-                    return self._eviction_result(
-                        session_id,
-                        expected_response_id,
-                        MemoryEvictionStatus.ACCESSED_AFTER_SELECTION,
-                    )
-
-                memory_expired = (
-                    memory_state.mem_idle_expires_at is not None
-                    and memory_state.mem_idle_expires_at <= now
-                )
-                if memory_expired:
-                    eviction_status = (
-                        MemoryEvictionStatus.EVICTED_REQUIRES_RERENDER
-                    )
-                elif force:
-                    eviction_status = MemoryEvictionStatus.FORCE_EVICTED
-                else:
-                    return self._eviction_result(
-                        session_id,
-                        expected_response_id,
-                        MemoryEvictionStatus.DISK_COPY_INVALID,
-                    )
-            elif disk_result.status is not DiskCopyStatus.READY:
+            # Disk TTL 是软过期：过期副本仍可用于恢复，只是会优先进入
+            # Disk cleanup。这样 Memory 淘汰不会制造不必要的重新 tokenizer。
+            if disk_result.status not in {
+                DiskCopyStatus.READY,
+                DiskCopyStatus.EXPIRED,
+            }:
                 if not force:
                     return self._eviction_result(
                         session_id,
@@ -234,6 +232,13 @@ class TieredSessionStore(SessionStore):
         expected_response_id: str,
     ) -> DiskEvictionResult:
         """条件删除 Disk 副本，不修改 Memory 副本。"""
+        if self._disk is None:
+            return DiskEvictionResult(
+                session_id=session_id,
+                response_id=expected_response_id,
+                status=DiskEvictionStatus.NOT_FOUND,
+            )
+
         async with self._get_lock(session_id):
             if await self._memory.exists(session_id):
                 return DiskEvictionResult(
@@ -276,28 +281,87 @@ class TieredSessionStore(SessionStore):
 
     async def is_disk_complete(self, session_id: str) -> bool:
         """供后续 Memory 淘汰模块判断该 Session 是否已经安全落盘。"""
+        if self._disk is None:
+            return False
         return await self._disk.is_complete(session_id)
 
     async def memory_used_bytes(self) -> int:
         return self._memory.used_bytes
 
     async def disk_used_bytes(self) -> int:
+        if self._disk is None:
+            return 0
         return await self._disk.used_bytes()
 
     async def close(self) -> None:
-        await self._disk.close()
+        if self._disk is not None:
+            await self._disk.close()
 
     @property
     def memory_store(self) -> MemorySessionStore:
         return self._memory
 
     @property
-    def disk_store(self) -> SQLiteSessionStore:
+    def disk_store(self) -> SQLiteSessionStore | None:
         return self._disk
 
     @property
+    def disk_enabled(self) -> bool:
+        return self._disk is not None
+
+    @property
     def metrics(self) -> ResponseStoreMetrics:
-        return self._disk.metrics
+        return self._metrics
+
+    async def _evict_memory_without_disk(
+        self,
+        session_id: str,
+        expected_response_id: str,
+        expected_updated_at: int,
+        now: int,
+        force: bool,
+    ) -> MemoryEvictionResult:
+        state = await self._memory.get_state_for_eviction(session_id)
+        if state is None:
+            return self._eviction_result(
+                session_id,
+                expected_response_id,
+                MemoryEvictionStatus.NOT_FOUND,
+            )
+
+        expired = (
+            state.mem_idle_expires_at is not None and state.mem_idle_expires_at <= now
+        )
+        if not expired and not force:
+            return self._eviction_result(
+                session_id,
+                expected_response_id,
+                MemoryEvictionStatus.DISK_COPY_INVALID,
+            )
+
+        memory_result = await self._memory.evict_if_unchanged(
+            session_id=session_id,
+            expected_response_id=expected_response_id,
+            expected_updated_at=expected_updated_at,
+        )
+        if not memory_result.evicted:
+            return self._eviction_result(
+                session_id,
+                expected_response_id,
+                self._map_memory_store_status(memory_result.status),
+            )
+
+        status = (
+            MemoryEvictionStatus.EVICTED_REQUIRES_RERENDER
+            if expired
+            else MemoryEvictionStatus.FORCE_EVICTED
+        )
+        return self._eviction_result(
+            session_id,
+            expected_response_id,
+            status,
+            memory_result.freed_bytes,
+        )
 
     def _get_lock(self, session_id: str) -> asyncio.Lock:
         return self._locks[hash(session_id) % len(self._locks)]

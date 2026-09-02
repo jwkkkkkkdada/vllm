@@ -41,7 +41,7 @@ class ResponsesStoreConfig:
     cleanup_max_bytes: int
     num_shards: int
     disk_write_interval_seconds: float
-    disk_recovery_wait_timeout_seconds: float
+    disk_enabled: bool = True
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace) -> ResponsesStoreConfig:
@@ -102,9 +102,7 @@ class ResponsesStoreConfig:
             disk_write_interval_seconds=(
                 args.responses_store_disk_write_interval_seconds
             ),
-            disk_recovery_wait_timeout_seconds=(
-                args.responses_store_disk_recovery_wait_timeout_seconds
-            ),
+            disk_enabled=getattr(args, "responses_store_disk_enabled", True),
         )
 
     def build_cleanup_config(self) -> PeriodicCleanupConfig:
@@ -145,7 +143,13 @@ def add_responses_store_cli_args(
     group.add_argument(
         "--enable-responses-store",
         action="store_true",
-        help="Enable the tiered Responses token store when integrated by the server.",
+        help="Enable the Responses token store when integrated by the server.",
+    )
+    group.add_argument(
+        "--responses-store-disk-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable SQLite as the Responses store's secondary storage tier.",
     )
     group.add_argument(
         "--responses-store-disk-path",
@@ -156,13 +160,19 @@ def add_responses_store_cli_args(
         "--responses-store-memory-capacity-mb",
         type=int,
         default=512,
-        help="Maximum logical memory-store capacity in MiB.",
+        help=(
+            "Memory capacity target for periodic cleanup, in MiB; "
+            "writes are not rejected."
+        ),
     )
     group.add_argument(
         "--responses-store-disk-capacity-mb",
         type=int,
         default=4096,
-        help="Maximum logical disk-store capacity in MiB.",
+        help=(
+            "Disk capacity target for periodic cleanup, in MiB; "
+            "writes are not rejected."
+        ),
     )
     group.add_argument(
         "--responses-store-memory-low-watermark",
@@ -229,12 +239,6 @@ def add_responses_store_cli_args(
         type=float,
         default=0.05,
         help="Disk writer batching interval in seconds.",
-    )
-    group.add_argument(
-        "--responses-store-disk-recovery-wait-timeout-seconds",
-        type=float,
-        default=0.2,
-        help="Maximum wait for an in-flight disk version during recovery.",
     )
     return parser
 

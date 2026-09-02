@@ -477,9 +477,10 @@ class EvictionPolicy:
 
             if projected_free_bytes > budget.max_bytes:
                 byte_limit_reached = True
-                # An expired record larger than the whole byte budget must
-                # still make progress. Select it alone, then end this batch.
-                if candidate.is_expired and not selected:
+                # The first candidate must still make progress even when it is
+                # larger than the batch budget; otherwise the same LRU entry
+                # can block every cleanup run indefinitely.
+                if not selected:
                     selected.append(candidate)
                     planned_free_bytes = projected_free_bytes
                 else:

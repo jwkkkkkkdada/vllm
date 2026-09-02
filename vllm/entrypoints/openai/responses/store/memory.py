@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import sys
 import time
 
@@ -21,12 +20,9 @@ class MemorySessionStore(SessionStore):
         self,
         max_capacity_bytes: int,
         mem_idle_ttl_seconds: int | None = None,
-        num_shards: int = 64,
     ) -> None:
         if max_capacity_bytes <= 0:
             raise ValueError("max_capacity_bytes must be greater than 0")
-        if num_shards <= 0:
-            raise ValueError("num_shards must be greater than 0")
         if mem_idle_ttl_seconds is not None and mem_idle_ttl_seconds <= 0:
             raise ValueError("mem_idle_ttl_seconds must be greater than 0")
 
@@ -34,7 +30,6 @@ class MemorySessionStore(SessionStore):
         self._max_capacity_bytes = max_capacity_bytes
         self._used_bytes = 0
         self._mem_idle_ttl_seconds = mem_idle_ttl_seconds
-        self._locks = [asyncio.Lock() for _ in range(num_shards)]
 
     async def save(
         self,
@@ -42,67 +37,60 @@ class MemorySessionStore(SessionStore):
         response_id: str,
         delta_token_ids: list[int],
     ) -> None:
-        async with self._get_lock(session_id):
-            state = self._data.get(session_id)
-            now = int(time.time())
+        state = self._data.get(session_id)
+        now = int(time.time())
 
-            if state is None:
-                state = SessionState(
-                    session_id=session_id,
-                    response_id=response_id,
-                    token_ids=list(delta_token_ids),
-                    created_at=now,
-                    updated_at=now,
-                    mem_idle_expires_at=self._build_expire_time(now),
-                    memory_resident=True,
-                )
-                state.mem_size_bytes = self._estimate_state_size_bytes(state)
-                self._data[session_id] = state
-                # 当前 vLLM API Server worker 使用单 event loop；这里没有 await，
-                # 不会在 += 中间发生 asyncio task 切换。
-                self._used_bytes += state.mem_size_bytes
-                return
-
-            old_size = state.mem_size_bytes
-            state.token_ids.extend(delta_token_ids)
-            state.response_id = response_id
-            state.updated_at = now
-            state.mem_idle_expires_at = self._build_expire_time(now)
+        if state is None:
+            state = SessionState(
+                session_id=session_id,
+                response_id=response_id,
+                token_ids=list(delta_token_ids),
+                created_at=now,
+                updated_at=now,
+                mem_idle_expires_at=self._build_expire_time(now),
+                memory_resident=True,
+            )
             state.mem_size_bytes = self._estimate_state_size_bytes(state)
-            self._used_bytes += state.mem_size_bytes - old_size
+            self._data[session_id] = state
+            self._used_bytes += state.mem_size_bytes
+            return
+
+        old_size = state.mem_size_bytes
+        state.token_ids.extend(delta_token_ids)
+        state.response_id = response_id
+        state.updated_at = now
+        state.mem_idle_expires_at = self._build_expire_time(now)
+        state.mem_size_bytes = self._estimate_state_size_bytes(state)
+        self._used_bytes += state.mem_size_bytes - old_size
 
     async def get(self, session_id: str) -> list[int] | None:
-        async with self._get_lock(session_id):
-            state = self._data.get(session_id)
-            if state is None:
-                return None
+        state = self._data.get(session_id)
+        if state is None:
+            return None
 
-            now = int(time.time())
-            state.updated_at = now
-            state.mem_idle_expires_at = self._build_expire_time(now)
-            return state.token_ids.copy()
+        now = int(time.time())
+        state.updated_at = now
+        state.mem_idle_expires_at = self._build_expire_time(now)
+        return state.token_ids.copy()
 
     async def exists(self, session_id: str) -> bool:
         """exists 不刷新 updated_at / idle TTL。"""
-        async with self._get_lock(session_id):
-            return session_id in self._data
+        return session_id in self._data
 
     async def delete(self, session_id: str) -> bool:
-        async with self._get_lock(session_id):
-            state = self._data.pop(session_id, None)
-            if state is None:
-                return False
+        state = self._data.pop(session_id, None)
+        if state is None:
+            return False
 
-            self._used_bytes -= state.mem_size_bytes
-            if self._used_bytes < 0:
-                self._used_bytes = 0
-            return True
+        self._used_bytes -= state.mem_size_bytes
+        if self._used_bytes < 0:
+            self._used_bytes = 0
+        return True
 
     async def get_state_for_eviction(self, session_id: str) -> SessionState | None:
         """返回不刷新访问时间和 TTL 的 Session 快照。"""
-        async with self._get_lock(session_id):
-            state = self._data.get(session_id)
-            return None if state is None else self._copy_state(state)
+        state = self._data.get(session_id)
+        return None if state is None else self._copy_state(state)
 
     async def check_eviction_candidate(
         self,
@@ -111,15 +99,14 @@ class MemorySessionStore(SessionStore):
         expected_updated_at: int,
     ) -> MemoryStoreEvictionStatus | None:
         """检查候选版本；返回 None 表示仍可继续淘汰。"""
-        async with self._get_lock(session_id):
-            state = self._data.get(session_id)
-            if state is None:
-                return MemoryStoreEvictionStatus.NOT_FOUND
-            if state.response_id != expected_response_id:
-                return MemoryStoreEvictionStatus.RESPONSE_CHANGED
-            if state.updated_at != expected_updated_at:
-                return MemoryStoreEvictionStatus.ACCESSED_AFTER_SELECTION
-            return None
+        state = self._data.get(session_id)
+        if state is None:
+            return MemoryStoreEvictionStatus.NOT_FOUND
+        if state.response_id != expected_response_id:
+            return MemoryStoreEvictionStatus.RESPONSE_CHANGED
+        if state.updated_at != expected_updated_at:
+            return MemoryStoreEvictionStatus.ACCESSED_AFTER_SELECTION
+        return None
 
     async def evict_if_unchanged(
         self,
@@ -128,39 +115,26 @@ class MemorySessionStore(SessionStore):
         expected_updated_at: int,
     ) -> MemoryStoreEvictionResult:
         """候选版本未变化时原子删除 Memory 副本。"""
-        async with self._get_lock(session_id):
-            state = self._data.get(session_id)
-            if state is None:
-                return MemoryStoreEvictionResult(
-                    MemoryStoreEvictionStatus.NOT_FOUND
-                )
-            if state.response_id != expected_response_id:
-                return MemoryStoreEvictionResult(
-                    MemoryStoreEvictionStatus.RESPONSE_CHANGED
-                )
-            if state.updated_at != expected_updated_at:
-                return MemoryStoreEvictionResult(
-                    MemoryStoreEvictionStatus.ACCESSED_AFTER_SELECTION
-                )
-
-            self._data.pop(session_id)
-            self._used_bytes = max(0, self._used_bytes - state.mem_size_bytes)
+        state = self._data.get(session_id)
+        if state is None:
+            return MemoryStoreEvictionResult(MemoryStoreEvictionStatus.NOT_FOUND)
+        if state.response_id != expected_response_id:
+            return MemoryStoreEvictionResult(MemoryStoreEvictionStatus.RESPONSE_CHANGED)
+        if state.updated_at != expected_updated_at:
             return MemoryStoreEvictionResult(
-                MemoryStoreEvictionStatus.EVICTED,
-                freed_bytes=state.mem_size_bytes,
+                MemoryStoreEvictionStatus.ACCESSED_AFTER_SELECTION
             )
 
+        self._data.pop(session_id)
+        self._used_bytes = max(0, self._used_bytes - state.mem_size_bytes)
+        return MemoryStoreEvictionResult(
+            MemoryStoreEvictionStatus.EVICTED,
+            freed_bytes=state.mem_size_bytes,
+        )
+
     async def list(self) -> list[SessionState]:
-        """低频管理接口：获取所有 shard lock 后返回一致性快照。"""
-        acquired: list[asyncio.Lock] = []
-        try:
-            for lock in self._locks:
-                await lock.acquire()
-                acquired.append(lock)
-            return [self._copy_state(state) for state in self._data.values()]
-        finally:
-            for lock in reversed(acquired):
-                lock.release()
+        """返回所有 Session 的一致性快照。"""
+        return [self._copy_state(state) for state in self._data.values()]
 
     async def restore_if_absent(self, state: SessionState) -> bool:
         """
@@ -169,20 +143,19 @@ class MemorySessionStore(SessionStore):
         只在 Memory 仍不存在该 Session 时恢复，避免 Disk 旧快照覆盖并发写入
         产生的新 Memory 状态。
         """
-        async with self._get_lock(state.session_id):
-            if state.session_id in self._data:
-                return False
+        if state.session_id in self._data:
+            return False
 
-            now = int(time.time())
-            restored = self._copy_state(state)
-            restored.updated_at = now
-            restored.mem_idle_expires_at = self._build_expire_time(now)
-            restored.memory_resident = True
-            restored.mem_size_bytes = self._estimate_state_size_bytes(restored)
+        now = int(time.time())
+        restored = self._copy_state(state)
+        restored.updated_at = now
+        restored.mem_idle_expires_at = self._build_expire_time(now)
+        restored.memory_resident = True
+        restored.mem_size_bytes = self._estimate_state_size_bytes(restored)
 
-            self._data[state.session_id] = restored
-            self._used_bytes += restored.mem_size_bytes
-            return True
+        self._data[state.session_id] = restored
+        self._used_bytes += restored.mem_size_bytes
+        return True
 
     @property
     def used_bytes(self) -> int:
@@ -199,9 +172,6 @@ class MemorySessionStore(SessionStore):
     @property
     def is_over_capacity(self) -> bool:
         return self._used_bytes > self._max_capacity_bytes
-
-    def _get_lock(self, session_id: str) -> asyncio.Lock:
-        return self._locks[hash(session_id) % len(self._locks)]
 
     def _build_expire_time(self, now: int) -> int | None:
         if self._mem_idle_ttl_seconds is None:
