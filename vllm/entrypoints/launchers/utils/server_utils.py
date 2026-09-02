@@ -67,19 +67,6 @@ _running_tasks: set[asyncio.Task] = set()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
-        responses_store_cleanup = getattr(
-            app.state,
-            "responses_store_cleanup",
-            None,
-        )
-        responses_session_store = getattr(
-            app.state,
-            "responses_session_store",
-            None,
-        )
-        if responses_store_cleanup is not None:
-            responses_store_cleanup.start()
-
         if app.state.log_stats:
             engine_client: EngineClient = app.state.engine_client
 
@@ -102,11 +89,6 @@ async def lifespan(app: FastAPI):
         finally:
             if task is not None:
                 task.cancel()
-
-            if responses_store_cleanup is not None:
-                await responses_store_cleanup.stop()
-            if responses_session_store is not None:
-                await responses_session_store.close()
 
             for attr_name in (
                 "openai_serving_transcription",

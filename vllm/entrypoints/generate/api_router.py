@@ -124,20 +124,6 @@ async def init_generate_state(
     if getattr(args, "cohere_format", None):
         default_chat_template_kwargs.setdefault("cohere_format", args.cohere_format)
 
-    responses_session_store = None
-    responses_store_cleanup = None
-    if envs.VLLM_ENABLE_RESPONSES_API_STORE:
-        from vllm.entrypoints.openai.responses.store.factory import (
-            create_responses_store,
-        )
-
-        responses_session_store, responses_store_cleanup = create_responses_store(args)
-
-    # The FastAPI lifespan starts cleanup after app initialization and closes
-    # both services during graceful shutdown.
-    state.responses_session_store = responses_session_store
-    state.responses_store_cleanup = responses_store_cleanup
-
     # Render endpoints are always backed by OnlineRenderer so that
     # /v1/chat/completions/render and /v1/completions/render work on both
     # generate-mode and render-only servers. Created in init_app_state.
@@ -159,7 +145,6 @@ async def init_generate_state(
             enable_force_include_usage=args.enable_force_include_usage,
             enable_log_outputs=args.enable_log_outputs,
             default_chat_template_kwargs=default_chat_template_kwargs,
-            session_store=responses_session_store,
         )
         if "generate" in supported_tasks
         else None

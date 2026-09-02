@@ -66,44 +66,6 @@ def test_config_arg_parsing(serve_parser, cli_config_file):
     assert args.port == 9000
 
 
-def test_responses_store_args(serve_parser):
-    args = serve_parser.parse_args(
-        [
-            "--responses-store-memory-capacity-mb",
-            "64",
-            "--responses-store-disk-capacity-mb",
-            "512",
-            "--responses-store-memory-low-watermark",
-            "0.4",
-            "--responses-store-memory-high-watermark",
-            "0.75",
-            "--responses-store-cleanup-interval-seconds",
-            "10",
-        ]
-    )
-
-    assert args.responses_store_memory_capacity_mb == 64
-    assert args.responses_store_disk_capacity_mb == 512
-    assert args.responses_store_memory_low_watermark == 0.4
-    assert args.responses_store_memory_high_watermark == 0.75
-    assert args.responses_store_cleanup_interval_seconds == 10
-    validate_parsed_serve_args(args)
-
-
-def test_responses_store_rejects_invalid_watermarks(serve_parser):
-    args = serve_parser.parse_args(
-        [
-            "--responses-store-disk-low-watermark",
-            "0.9",
-            "--responses-store-disk-high-watermark",
-            "0.8",
-        ]
-    )
-
-    with pytest.raises(ValueError, match="disk watermarks"):
-        validate_parsed_serve_args(args)
-
-
 ### Tests for LoRA module parsing
 def test_valid_key_value_format(serve_parser):
     # Test old format: name=path
