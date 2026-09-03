@@ -178,6 +178,8 @@ def build_app(
     else:
         app = FastAPI(lifespan=lifespan)
     app.state.args = args
+    app.state.responses_store_enabled = getattr(args, "enable_responses_store", False)
+    app.state.responses_store_service = None
 
     from vllm.entrypoints.serve import register_vllm_serve_api_routers
 
