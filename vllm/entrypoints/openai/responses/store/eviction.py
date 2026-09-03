@@ -11,6 +11,7 @@ from .base import (
     DiskEvictionStatus,
     MemoryEvictionResult,
     MemoryEvictionStatus,
+    SessionMetadata,
 )
 
 logger = init_logger(__name__)
@@ -36,17 +37,6 @@ class EvictionExecutionContext:
     initial_used_bytes: int
     target_used_bytes: int | None
 
-
-class SessionMetadata(Protocol):
-    session_id: str
-    response_id: str
-    created_at: int
-    updated_at: int
-    mem_idle_expires_at: int | None
-    disk_idle_expires_at: int | None
-    mem_size_bytes: int
-    disk_size_bytes: int
-    memory_resident: bool
 
 @dataclass(frozen=True, slots=True)
 class EvictionCandidate:

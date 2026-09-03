@@ -8,6 +8,7 @@ from .base import (
     MemoryEvictionResult,
     MemoryEvictionStatus,
     MemoryStoreEvictionStatus,
+    SessionMetadata,
     SessionState,
     SessionStore,
 )
@@ -127,6 +128,23 @@ class TieredSessionStore(SessionStore):
                 memory_state.disk_size_bytes = disk_state.disk_size_bytes
             # 在线 token / response 状态以 Memory 为准。
             merged[memory_state.session_id] = memory_state
+        return list(merged.values())
+
+    async def list_metadata(self) -> list[SessionMetadata]:
+        if self._disk is None:
+            return await self._memory.list_metadata()
+
+        memory_metadata, disk_metadata = await asyncio.gather(
+            self._memory.list_metadata(), self._disk.list_metadata()
+        )
+
+        merged = {metadata.session_id: metadata for metadata in disk_metadata}
+        for memory_item in memory_metadata:
+            disk_item = merged.get(memory_item.session_id)
+            if disk_item is not None:
+                memory_item.disk_idle_expires_at = disk_item.disk_idle_expires_at
+                memory_item.disk_size_bytes = disk_item.disk_size_bytes
+            merged[memory_item.session_id] = memory_item
         return list(merged.values())
 
     async def evict_memory_candidate(

@@ -6,6 +6,7 @@ import time
 from .base import (
     MemoryStoreEvictionResult,
     MemoryStoreEvictionStatus,
+    SessionMetadata,
     SessionState,
     SessionStore,
 )
@@ -135,6 +136,22 @@ class MemorySessionStore(SessionStore):
     async def list(self) -> list[SessionState]:
         """返回所有 Session 的一致性快照。"""
         return [self._copy_state(state) for state in self._data.values()]
+
+    async def list_metadata(self) -> list[SessionMetadata]:
+        return [
+            SessionMetadata(
+                session_id=state.session_id,
+                response_id=state.response_id,
+                created_at=state.created_at,
+                updated_at=state.updated_at,
+                mem_idle_expires_at=state.mem_idle_expires_at,
+                disk_idle_expires_at=state.disk_idle_expires_at,
+                mem_size_bytes=state.mem_size_bytes,
+                disk_size_bytes=state.disk_size_bytes,
+                memory_resident=state.memory_resident,
+            )
+            for state in self._data.values()
+        ]
 
     async def restore_if_absent(self, state: SessionState) -> bool:
         """

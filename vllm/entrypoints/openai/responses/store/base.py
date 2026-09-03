@@ -136,6 +136,21 @@ class DiskEvictionResult:
 
 
 @dataclass(slots=True)
+class SessionMetadata:
+    """Session fields needed for capacity and eviction decisions."""
+
+    session_id: str
+    response_id: str
+    created_at: int
+    updated_at: int
+    mem_idle_expires_at: int | None = None
+    disk_idle_expires_at: int | None = None
+    mem_size_bytes: int = 0
+    disk_size_bytes: int = 0
+    memory_resident: bool = False
+
+
+@dataclass(slots=True)
 class SessionState:
     """一个 Session 对应一个状态对象。"""
 
@@ -185,4 +200,9 @@ class SessionStore(ABC):
     @abstractmethod
     async def list(self) -> list[SessionState]:
         """返回当前 Store 中所有可读取 Session 的状态快照。"""
+        ...
+
+    @abstractmethod
+    async def list_metadata(self) -> list[SessionMetadata]:
+        """Return metadata snapshots without materializing token IDs."""
         ...

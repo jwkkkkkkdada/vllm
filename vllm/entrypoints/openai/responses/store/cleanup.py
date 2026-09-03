@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 from vllm.logger import init_logger
 
+from .base import SessionMetadata
 from .eviction import (
     CapacityWaterMarks,
     DiskEvictionBatchResult,
@@ -19,7 +20,6 @@ from .eviction import (
     EvictionTriggerDecision,
     MemoryEvictionBatchResult,
     MemoryEvictionExecutor,
-    SessionMetadata,
     StorageTier,
 )
 from .metrics import (
@@ -136,7 +136,7 @@ class PeriodicSessionStoreCleanup:
             started_at = int(time.time())
             started_monotonic = time.monotonic()
 
-            records = await self._store.list()
+            records = await self._store.list_metadata()
             scanned_session_count = len(records)
             memory_candidates = self._memory_policy.build_sorted_candidates(
                 records,

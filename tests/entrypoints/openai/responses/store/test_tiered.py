@@ -7,7 +7,16 @@ import time
 import pytest
 
 from vllm.entrypoints.openai.responses.store.base import MemoryEvictionStatus
+from vllm.entrypoints.openai.responses.store.cleanup import (
+    PeriodicCleanupConfig,
+    PeriodicSessionStoreCleanup,
+    TierCleanupConfig,
+)
 from vllm.entrypoints.openai.responses.store.disk import SQLiteSessionStore
+from vllm.entrypoints.openai.responses.store.eviction import (
+    CapacityWaterMarks,
+    EvictionSelectionBudget,
+)
 from vllm.entrypoints.openai.responses.store.memory import MemorySessionStore
 from vllm.entrypoints.openai.responses.store.tiered import TieredSessionStore
 
@@ -103,6 +112,57 @@ async def test_pending_disk_data_is_replaced_by_complete_snapshot() -> None:
         await _wait_until_complete(disk, "session-1")
         assert await store.memory_store.delete("session-1")
         assert await store.get("session-1") == [1, 2, 3]
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_scans_metadata_without_materializing_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    disk = SQLiteSessionStore(":memory:", write_interval_seconds=0.001)
+    store = TieredSessionStore(
+        MemorySessionStore(max_capacity_bytes=1024 * 1024),
+        disk,
+    )
+    watermarks = CapacityWaterMarks(
+        max_bytes=1024 * 1024,
+        low_watermark_bytes=512 * 1024,
+        high_watermark_bytes=768 * 1024,
+    )
+    tier_config = TierCleanupConfig(
+        watermarks=watermarks,
+        budget=EvictionSelectionBudget(
+            max_candidates=16,
+            max_bytes=1024 * 1024,
+        ),
+    )
+    cleanup = PeriodicSessionStoreCleanup(
+        store,
+        PeriodicCleanupConfig(
+            interval_seconds=1,
+            memory=tier_config,
+            disk=tier_config,
+        ),
+    )
+
+    async def fail_full_list() -> list[object]:
+        raise AssertionError("cleanup must not request full session states")
+
+    def fail_decrypt(*_args: object) -> list[int]:
+        raise AssertionError("cleanup must not decrypt token data")
+
+    try:
+        await store.save("session-1", "response-1", [1, 2, 3])
+        await _wait_until_complete(disk, "session-1")
+        monkeypatch.setattr(store, "list", fail_full_list)
+        monkeypatch.setattr(store.memory_store, "list", fail_full_list)
+        monkeypatch.setattr(disk, "list", fail_full_list)
+        monkeypatch.setattr(disk, "_decrypt_token_ids", fail_decrypt)
+
+        result = await cleanup.run_once()
+
+        assert result.scanned_session_count == 1
     finally:
         await store.close()
 

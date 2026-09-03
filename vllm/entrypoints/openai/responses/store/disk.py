@@ -14,6 +14,7 @@ from vllm.logger import init_logger
 from .base import (
     DiskEvictionResult,
     DiskEvictionStatus,
+    SessionMetadata,
     SessionState,
     SessionStore,
 )
@@ -342,6 +343,21 @@ class SQLiteSessionStore(SessionStore):
                 ):
                     result.append(state)
             return result
+
+    async def list_metadata(self) -> list[SessionMetadata]:
+        """Return complete-copy metadata without reading encrypted token data."""
+        self._ensure_open()
+
+        async with self._io_lock, self._meta_lock:
+            rows = await asyncio.to_thread(self._list_metadata_sync)
+            return [
+                metadata
+                for metadata, version in rows
+                if (
+                    self._latest_versions.get(metadata.session_id) == version
+                    and self._committed_versions.get(metadata.session_id) == version
+                )
+            ]
 
     async def is_complete(self, session_id: str) -> bool:
         """
@@ -913,6 +929,32 @@ class SQLiteSessionStore(SessionStore):
             )
             result.append((state, write_version))
         return result, corrupt_copies
+
+    def _list_metadata_sync(self) -> list[tuple[SessionMetadata, int]]:
+        rows = self._conn.execute(
+            """
+            SELECT session_id, response_id, created_at, updated_at,
+                   disk_idle_expires_at, disk_size_bytes, write_version
+            FROM session_state
+            """
+        ).fetchall()
+
+        return [
+            (
+                SessionMetadata(
+                    session_id=str(row[0]),
+                    response_id=str(row[1]),
+                    created_at=int(row[2]),
+                    updated_at=int(row[3]),
+                    disk_idle_expires_at=(
+                        None if row[4] is None else int(row[4])
+                    ),
+                    disk_size_bytes=int(row[5]),
+                ),
+                int(row[6]),
+            )
+            for row in rows
+        ]
 
     def _build_expire_time(self, now: int) -> int | None:
         if self._disk_idle_ttl_seconds is None:
