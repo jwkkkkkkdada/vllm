@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import array
 import asyncio
+import hmac
 import sqlite3
 import sys
 import time
@@ -19,7 +20,12 @@ from .base import (
     SessionStore,
 )
 from .crypto import DataDecryptionError, FramedAESGCMCipher
-from .key_provider import EphemeralKeyProvider, KeyProvider
+from .key_provider import (
+    EphemeralKeyProvider,
+    FileKeyProvider,
+    KeyProvider,
+    StaticKeyProvider,
+)
 from .metrics import ResponseStoreMetrics
 
 logger = init_logger(__name__)
@@ -72,7 +78,7 @@ class SQLiteSessionStore(SessionStore):
     """
     SQLite 二级存储。
 
-    - 构造时清空旧表：不做重启恢复。
+    - 临时模式在构造时清空旧表；恢复模式校验密钥并重建版本索引。
     - save() 只写进程内 pending，不做 SQLite I/O。
     - 后台单 Writer 按时间窗口合并同一 Session 的多次 save。
     - Token ID 以独立 AES-GCM 帧加密，增量写入不解密历史数据。
@@ -82,6 +88,11 @@ class SQLiteSessionStore(SessionStore):
     """
 
     _TOKEN_TYPECODE = "I"  # uint32
+    _LEGACY_SCHEMA_VERSION = 1
+    _SCHEMA_VERSION = 2
+    _KEY_CHECK_PLAINTEXT = b"vllm-responses-store-key-check-v1"
+    _KEY_CHECK_ASSOCIATED_DATA = b"responses-store-metadata"
+    KEY_ROTATION_INTERVAL_SECONDS = 90 * 24 * 60 * 60
 
     def __init__(
         self,
@@ -90,6 +101,8 @@ class SQLiteSessionStore(SessionStore):
         write_interval_seconds: float = 0.05,
         key_provider: KeyProvider | None = None,
         metrics: ResponseStoreMetrics | None = None,
+        recover_existing: bool = False,
+        key_rotation_interval_seconds: int = KEY_ROTATION_INTERVAL_SECONDS,
     ) -> None:
         if not db_path:
             raise ValueError("db_path must not be empty")
@@ -99,10 +112,19 @@ class SQLiteSessionStore(SessionStore):
             raise ValueError("write_interval_seconds must be greater than 0")
         if array.array(self._TOKEN_TYPECODE).itemsize != 4:
             raise RuntimeError("32-bit unsigned int array is required")
+        if recover_existing and key_provider is None:
+            raise ValueError("recover_existing requires a persistent key provider")
+        if key_rotation_interval_seconds <= 0:
+            raise ValueError("key_rotation_interval_seconds must be greater than 0")
 
         self._db_path = db_path
         self._disk_idle_ttl_seconds = disk_idle_ttl_seconds
         self._write_interval_seconds = write_interval_seconds
+        self._recover_existing = recover_existing
+        self._key_rotation_interval_seconds = key_rotation_interval_seconds
+        self._key_file_provider = (
+            key_provider if isinstance(key_provider, FileKeyProvider) else None
+        )
         self._cipher = FramedAESGCMCipher(
             key_provider if key_provider is not None else EphemeralKeyProvider()
         )
@@ -139,7 +161,11 @@ class SQLiteSessionStore(SessionStore):
         # SQLite 操作仍通过 _io_lock 串行，并放入 asyncio.to_thread()。
         # 对调用方异步执行，但多个SQLite操作串行执行
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
-        self._initialize_database()
+        try:
+            self._initialize_database()
+        except Exception:
+            self._conn.close()
+            raise
 
     async def save(
         self,
@@ -228,6 +254,23 @@ class SQLiteSessionStore(SessionStore):
     @property
     def metrics(self) -> ResponseStoreMetrics:
         return self._metrics
+
+    @property
+    def automatic_key_rotation_enabled(self) -> bool:
+        return self._recover_existing and self._key_file_provider is not None
+
+    async def rotate_key_if_due(self, now: int | None = None) -> bool:
+        """Atomically re-encrypt the complete database when its key is due."""
+        self._ensure_open()
+        if not self.automatic_key_rotation_enabled:
+            return False
+
+        rotation_time = int(time.time()) if now is None else now
+        async with self._io_lock:
+            return await asyncio.to_thread(
+                self._rotate_key_if_due_sync,
+                rotation_time,
+            )
 
     async def get(self, session_id: str) -> list[int] | None:
         state = await self.get_state(session_id)
@@ -498,30 +541,459 @@ class SQLiteSessionStore(SessionStore):
 
     def _initialize_database(self) -> None:
         cursor = self._conn.cursor()
+        recovered_count: int | None = None
+        pending_key_to_promote: bytes | None = None
+        discard_pending_key = False
         try:
             cursor.execute("PRAGMA journal_mode=WAL")
-            # Disk 是当前进程生命周期内的可丢弃二级缓存，不要求 crash durability。
-            cursor.execute("PRAGMA synchronous=NORMAL")
-
-            # 明确不做重启恢复：启动时直接清空旧数据。
-            cursor.execute("DROP TABLE IF EXISTS session_state")
             cursor.execute(
-                """
-                CREATE TABLE session_state (
-                    session_id TEXT PRIMARY KEY,
-                    response_id TEXT NOT NULL,
-                    token_ids BLOB NOT NULL,
-                    created_at INTEGER NOT NULL,
-                    updated_at INTEGER NOT NULL,
-                    disk_idle_expires_at INTEGER,
-                    disk_size_bytes INTEGER NOT NULL,
-                    write_version INTEGER NOT NULL
-                )
-                """
+                "PRAGMA synchronous=FULL"
+                if self._recover_existing
+                else "PRAGMA synchronous=NORMAL"
             )
+            cursor.execute("BEGIN IMMEDIATE")
+
+            if self._recover_existing:
+                (
+                    recovered_count,
+                    pending_key_to_promote,
+                    discard_pending_key,
+                ) = self._initialize_recoverable_database(cursor)
+            else:
+                self._initialize_ephemeral_database(cursor)
             self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
         finally:
             cursor.close()
+
+        if pending_key_to_promote is not None:
+            assert self._key_file_provider is not None
+            self._key_file_provider.promote_pending_key(pending_key_to_promote)
+        elif discard_pending_key:
+            assert self._key_file_provider is not None
+            try:
+                self._key_file_provider.discard_pending_key()
+            except RuntimeError:
+                logger.warning(
+                    "Unable to remove stale Responses store pending key",
+                    exc_info=True,
+                )
+
+        if recovered_count is not None:
+            logger.info(
+                "Recovered %d persisted Responses store sessions from %s",
+                recovered_count,
+                self._db_path,
+            )
+
+    def _initialize_ephemeral_database(self, cursor: sqlite3.Cursor) -> None:
+        if self._table_exists(cursor, "store_metadata"):
+            raise RuntimeError(
+                "Refusing to reset a persistent Responses store without its key file"
+            )
+
+        cursor.execute("DROP TABLE IF EXISTS session_state")
+        self._create_session_state_table(cursor)
+
+    def _initialize_recoverable_database(
+        self, cursor: sqlite3.Cursor
+    ) -> tuple[int, bytes | None, bool]:
+        metadata_exists = self._table_exists(cursor, "store_metadata")
+        session_state_exists = self._table_exists(cursor, "session_state")
+        pending_key_to_promote: bytes | None = None
+        discard_pending_key = False
+
+        if metadata_exists:
+            if not session_state_exists:
+                raise RuntimeError(
+                    "Persistent Responses store is missing the session_state table"
+                )
+            self._validate_session_state_schema(cursor)
+            (
+                pending_key_to_promote,
+                discard_pending_key,
+            ) = self._select_database_key(cursor)
+            self._migrate_store_metadata(cursor, int(time.time()))
+            self._validate_store_metadata(cursor)
+        else:
+            if session_state_exists:
+                self._validate_session_state_schema(cursor)
+                row = cursor.execute("SELECT 1 FROM session_state LIMIT 1").fetchone()
+                if row is not None:
+                    raise RuntimeError(
+                        "Existing Responses store data has no key metadata and "
+                        "cannot be safely recovered"
+                    )
+            else:
+                self._create_session_state_table(cursor)
+            self._create_store_metadata(cursor)
+
+        return (
+            self._restore_version_index(cursor),
+            pending_key_to_promote,
+            discard_pending_key,
+        )
+
+    @staticmethod
+    def _table_exists(cursor: sqlite3.Cursor, table_name: str) -> bool:
+        row = cursor.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table_name,),
+        ).fetchone()
+        return row is not None
+
+    @staticmethod
+    def _create_session_state_table(cursor: sqlite3.Cursor) -> None:
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS session_state (
+                session_id TEXT PRIMARY KEY,
+                response_id TEXT NOT NULL,
+                token_ids BLOB NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                disk_idle_expires_at INTEGER,
+                disk_size_bytes INTEGER NOT NULL,
+                write_version INTEGER NOT NULL
+            )
+            """
+        )
+
+    def _create_store_metadata(self, cursor: sqlite3.Cursor) -> None:
+        cursor.execute(
+            """
+            CREATE TABLE store_metadata (
+                singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+                schema_version INTEGER NOT NULL,
+                key_check BLOB NOT NULL,
+                key_rotated_at INTEGER NOT NULL
+            )
+            """
+        )
+        key_check = self._cipher.encrypt(
+            self._KEY_CHECK_PLAINTEXT,
+            self._KEY_CHECK_ASSOCIATED_DATA,
+        )
+        cursor.execute(
+            """
+            INSERT INTO store_metadata (
+                singleton_id, schema_version, key_check, key_rotated_at
+            ) VALUES (1, ?, ?, ?)
+            """,
+            (self._SCHEMA_VERSION, key_check, int(time.time())),
+        )
+
+    def _read_store_metadata(
+        self, cursor: sqlite3.Cursor
+    ) -> tuple[int, bytes, int | None]:
+        columns = {
+            str(row[1])
+            for row in cursor.execute("PRAGMA table_info(store_metadata)").fetchall()
+        }
+        if not {"singleton_id", "schema_version", "key_check"} <= columns:
+            raise RuntimeError("Persistent Responses store metadata is incompatible")
+
+        has_rotation_time = "key_rotated_at" in columns
+        row = cursor.execute(
+            "SELECT schema_version, key_check, key_rotated_at "
+            "FROM store_metadata WHERE singleton_id = 1"
+            if has_rotation_time
+            else "SELECT schema_version, key_check, NULL "
+            "FROM store_metadata WHERE singleton_id = 1"
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("Persistent Responses store metadata is missing")
+
+        schema_version = int(row[0])
+        if schema_version not in {
+            self._LEGACY_SCHEMA_VERSION,
+            self._SCHEMA_VERSION,
+        }:
+            raise RuntimeError(
+                "Unsupported Responses store schema version: "
+                f"{schema_version}; expected {self._LEGACY_SCHEMA_VERSION} "
+                f"or {self._SCHEMA_VERSION}"
+            )
+        if schema_version == self._SCHEMA_VERSION and not has_rotation_time:
+            raise RuntimeError(
+                "Persistent Responses store metadata is missing key_rotated_at"
+            )
+        rotated_at = None if row[2] is None else int(row[2])
+        return schema_version, bytes(row[1]), rotated_at
+
+    def _validate_store_metadata(self, cursor: sqlite3.Cursor) -> int:
+        schema_version, encrypted_check, rotated_at = self._read_store_metadata(cursor)
+        if schema_version != self._SCHEMA_VERSION or rotated_at is None:
+            raise RuntimeError("Persistent Responses store metadata was not migrated")
+        if not self._key_matches(encrypted_check, self._cipher):
+            raise ValueError(
+                "Responses store key does not match the persistent database"
+            )
+        return rotated_at
+
+    def _select_database_key(self, cursor: sqlite3.Cursor) -> tuple[bytes | None, bool]:
+        _, encrypted_check, _ = self._read_store_metadata(cursor)
+        if self._key_matches(encrypted_check, self._cipher):
+            discard_pending = (
+                self._key_file_provider is not None
+                and self._key_file_provider.get_pending_key() is not None
+            )
+            return None, discard_pending
+
+        if self._key_file_provider is not None:
+            pending_key = self._key_file_provider.get_pending_key()
+            if pending_key is not None:
+                pending_cipher = FramedAESGCMCipher(StaticKeyProvider(pending_key))
+                if self._key_matches(encrypted_check, pending_cipher):
+                    self._cipher = pending_cipher
+                    return pending_key, False
+
+        raise ValueError("Responses store key does not match the persistent database")
+
+    def _migrate_store_metadata(self, cursor: sqlite3.Cursor, now: int) -> None:
+        schema_version, _, rotated_at = self._read_store_metadata(cursor)
+        if schema_version == self._SCHEMA_VERSION:
+            if rotated_at is None:
+                raise RuntimeError(
+                    "Persistent Responses store metadata has no rotation time"
+                )
+            return
+
+        cursor.execute("ALTER TABLE store_metadata ADD COLUMN key_rotated_at INTEGER")
+        cursor.execute(
+            """
+            UPDATE store_metadata
+            SET schema_version = ?, key_rotated_at = ?
+            WHERE singleton_id = 1
+            """,
+            (self._SCHEMA_VERSION, now),
+        )
+
+    def _key_matches(
+        self,
+        encrypted_check: bytes,
+        cipher: FramedAESGCMCipher,
+    ) -> bool:
+        try:
+            key_check = cipher.decrypt(
+                encrypted_check,
+                self._KEY_CHECK_ASSOCIATED_DATA,
+            )
+        except DataDecryptionError:
+            return False
+        return hmac.compare_digest(key_check, self._KEY_CHECK_PLAINTEXT)
+
+    @staticmethod
+    def _validate_session_state_schema(cursor: sqlite3.Cursor) -> None:
+        required_columns = {
+            "session_id",
+            "response_id",
+            "token_ids",
+            "created_at",
+            "updated_at",
+            "disk_idle_expires_at",
+            "disk_size_bytes",
+            "write_version",
+        }
+        columns = {
+            str(row[1])
+            for row in cursor.execute("PRAGMA table_info(session_state)").fetchall()
+        }
+        missing_columns = required_columns - columns
+        if missing_columns:
+            raise RuntimeError(
+                "Persistent Responses store has an incompatible session_state "
+                f"schema; missing columns: {sorted(missing_columns)}"
+            )
+
+    def _restore_version_index(self, cursor: sqlite3.Cursor) -> int:
+        rows = cursor.execute(
+            """
+            SELECT session_id, response_id, write_version
+            FROM session_state
+            """
+        ).fetchall()
+
+        for session_id_value, response_id_value, version_value in rows:
+            session_id = str(session_id_value)
+            response_id = str(response_id_value)
+            version = int(version_value)
+            if version <= 0:
+                raise RuntimeError(
+                    "Persistent Responses store contains an invalid write version"
+                )
+            self._latest_versions[session_id] = version
+            self._committed_versions[session_id] = version
+            self._latest_response_ids[session_id] = response_id
+            self._version_counter = max(self._version_counter, version)
+
+        return len(rows)
+
+    def _rotate_key_if_due_sync(self, now: int) -> bool:
+        key_provider = self._key_file_provider
+        assert key_provider is not None
+
+        cursor = self._conn.cursor()
+        committed = False
+        new_key: bytes | None = None
+        try:
+            _, encrypted_check, rotated_at = self._read_store_metadata(cursor)
+            pending_key = key_provider.get_pending_key()
+            if pending_key is not None:
+                pending_cipher = FramedAESGCMCipher(StaticKeyProvider(pending_key))
+                if self._key_matches(encrypted_check, pending_cipher):
+                    self._cipher = pending_cipher
+                    key_provider.promote_pending_key(pending_key)
+                elif self._key_matches(encrypted_check, self._cipher):
+                    key_provider.discard_pending_key()
+                else:
+                    raise ValueError(
+                        "Neither active nor pending Responses store key matches "
+                        "the persistent database"
+                    )
+
+            if rotated_at is None:
+                raise RuntimeError(
+                    "Persistent Responses store metadata has no rotation time"
+                )
+            if not self._key_matches(encrypted_check, self._cipher):
+                raise ValueError(
+                    "Responses store key does not match the persistent database"
+                )
+            if now < rotated_at + self._key_rotation_interval_seconds:
+                return False
+
+            new_key = key_provider.stage_new_key()
+            new_cipher = FramedAESGCMCipher(StaticKeyProvider(new_key))
+
+            cursor.execute("BEGIN IMMEDIATE")
+            _, encrypted_check, rotated_at = self._read_store_metadata(cursor)
+            if rotated_at is None:
+                raise RuntimeError(
+                    "Persistent Responses store metadata has no rotation time"
+                )
+            if not self._key_matches(encrypted_check, self._cipher):
+                raise ValueError("Responses store key changed before rotation")
+            if now < rotated_at + self._key_rotation_interval_seconds:
+                self._conn.rollback()
+                key_provider.discard_pending_key()
+                return False
+
+            rotated_sessions = self._reencrypt_all_sessions(
+                cursor,
+                old_cipher=self._cipher,
+                new_cipher=new_cipher,
+            )
+            new_key_check = new_cipher.encrypt(
+                self._KEY_CHECK_PLAINTEXT,
+                self._KEY_CHECK_ASSOCIATED_DATA,
+            )
+            cursor.execute(
+                """
+                UPDATE store_metadata
+                SET key_check = ?, key_rotated_at = ?
+                WHERE singleton_id = 1
+                """,
+                (new_key_check, now),
+            )
+            self._conn.commit()
+            committed = True
+            self._cipher = new_cipher
+
+            key_provider.promote_pending_key(new_key)
+            logger.info(
+                "Rotated Responses store key for %d persisted sessions in %s",
+                rotated_sessions,
+                self._db_path,
+            )
+            return True
+        except Exception:
+            if not committed:
+                self._conn.rollback()
+                if new_key is not None:
+                    try:
+                        key_provider.discard_pending_key()
+                    except RuntimeError:
+                        logger.warning(
+                            "Unable to remove failed Responses store pending key",
+                            exc_info=True,
+                        )
+            raise
+        finally:
+            cursor.close()
+
+    def _reencrypt_all_sessions(
+        self,
+        cursor: sqlite3.Cursor,
+        old_cipher: FramedAESGCMCipher,
+        new_cipher: FramedAESGCMCipher,
+    ) -> int:
+        rotated_sessions = 0
+        last_session_id: str | None = None
+        try:
+            while True:
+                if last_session_id is None:
+                    rows = cursor.execute(
+                        """
+                        SELECT session_id, response_id, token_ids
+                        FROM session_state
+                        ORDER BY session_id
+                        LIMIT 128
+                        """
+                    ).fetchall()
+                else:
+                    rows = cursor.execute(
+                        """
+                        SELECT session_id, response_id, token_ids
+                        FROM session_state
+                        WHERE session_id > ?
+                        ORDER BY session_id
+                        LIMIT 128
+                        """,
+                        (last_session_id,),
+                    ).fetchall()
+                if not rows:
+                    break
+
+                for session_id_value, response_id_value, encrypted_blob in rows:
+                    session_id = str(session_id_value)
+                    response_id = str(response_id_value)
+                    encryption_context = self._encryption_context(session_id)
+                    plaintext = old_cipher.decrypt(
+                        bytes(encrypted_blob),
+                        encryption_context,
+                    )
+                    encryption_started_ns = time.perf_counter_ns()
+                    new_encrypted_blob = new_cipher.encrypt(
+                        plaintext,
+                        encryption_context,
+                    )
+                    self._metrics.record_encryption(
+                        plaintext_bytes=len(plaintext),
+                        duration_ns=(time.perf_counter_ns() - encryption_started_ns),
+                    )
+                    disk_size = self._estimate_disk_size_bytes(
+                        session_id,
+                        response_id,
+                        new_encrypted_blob,
+                    )
+                    cursor.execute(
+                        """
+                        UPDATE session_state
+                        SET token_ids = ?, disk_size_bytes = ?
+                        WHERE session_id = ?
+                        """,
+                        (new_encrypted_blob, disk_size, session_id),
+                    )
+                    rotated_sessions += 1
+                last_session_id = str(rows[-1][0])
+        except DataDecryptionError as exc:
+            raise DataDecryptionError(
+                "Unable to rotate corrupted Responses store data"
+            ) from exc
+        return rotated_sessions
 
     def _ensure_open(self) -> None:
         if self._closed or self._closing:
@@ -946,9 +1418,7 @@ class SQLiteSessionStore(SessionStore):
                     response_id=str(row[1]),
                     created_at=int(row[2]),
                     updated_at=int(row[3]),
-                    disk_idle_expires_at=(
-                        None if row[4] is None else int(row[4])
-                    ),
+                    disk_idle_expires_at=(None if row[4] is None else int(row[4])),
                     disk_size_bytes=int(row[5]),
                 ),
                 int(row[6]),

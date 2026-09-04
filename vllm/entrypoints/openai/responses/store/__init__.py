@@ -42,6 +42,7 @@ class ResponsesStoreConfig:
     num_shards: int
     disk_write_interval_seconds: float
     disk_enabled: bool = True
+    key_file: str | None = None
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace) -> ResponsesStoreConfig:
@@ -81,6 +82,21 @@ class ResponsesStoreConfig:
         if args.responses_store_disk_write_interval_seconds <= 0:
             raise ValueError("disk write interval must be greater than 0")
 
+        key_file = getattr(args, "responses_store_key_file", None)
+        if key_file is not None:
+            if not getattr(args, "responses_store_disk_enabled", True):
+                raise ValueError(
+                    "responses store key file requires the disk tier to be enabled"
+                )
+            if not args.responses_store_disk_path:
+                raise ValueError(
+                    "responses store key file requires an explicit disk path"
+                )
+            if args.responses_store_disk_path == ":memory:":
+                raise ValueError(
+                    "responses store recovery requires a persistent disk path"
+                )
+
         memory_capacity_bytes = args.responses_store_memory_capacity_mb * _MIB
         disk_capacity_bytes = args.responses_store_disk_capacity_mb * _MIB
 
@@ -111,6 +127,7 @@ class ResponsesStoreConfig:
                 args.responses_store_disk_write_interval_seconds
             ),
             disk_enabled=getattr(args, "responses_store_disk_enabled", True),
+            key_file=key_file,
         )
 
     def build_cleanup_config(self) -> PeriodicCleanupConfig:
@@ -163,6 +180,16 @@ def add_responses_store_cli_args(
         "--responses-store-disk-path",
         default=None,
         help="SQLite path. Defaults to a process-local file in the temp directory.",
+    )
+    group.add_argument(
+        "--responses-store-key-file",
+        default=None,
+        help=(
+            "File containing a Base64-encoded 32-byte AES-256 key. Providing "
+            "this option enables recovery from the explicitly configured "
+            "SQLite path and atomic database-wide key rotation every 90 days. "
+            "The file and its parent directory must be writable."
+        ),
     )
     group.add_argument(
         "--responses-store-memory-capacity-mb",

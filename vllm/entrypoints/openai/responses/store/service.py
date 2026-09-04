@@ -8,8 +8,10 @@ import argparse
 from . import ResponsesStoreConfig
 from .cleanup import PeriodicSessionStoreCleanup
 from .disk import SQLiteSessionStore
+from .key_provider import FileKeyProvider
 from .memory import MemorySessionStore
 from .metrics import ResponseStoreMetrics
+from .rotation import PeriodicDatabaseKeyRotation
 from .tiered import TieredSessionStore
 
 
@@ -23,12 +25,17 @@ class ResponsesStoreService:
             max_capacity_bytes=config.memory_capacity_bytes,
             mem_idle_ttl_seconds=config.memory_ttl_seconds,
         )
+        key_provider = (
+            FileKeyProvider(config.key_file) if config.key_file is not None else None
+        )
         disk_store = (
             SQLiteSessionStore(
                 db_path=config.disk_path,
                 disk_idle_ttl_seconds=config.disk_ttl_seconds,
                 write_interval_seconds=config.disk_write_interval_seconds,
+                key_provider=key_provider,
                 metrics=metrics,
+                recover_existing=config.key_file is not None,
             )
             if config.disk_enabled
             else None
@@ -41,6 +48,11 @@ class ResponsesStoreService:
         self._cleanup = PeriodicSessionStoreCleanup(
             store=self._store,
             config=config.build_cleanup_config(),
+        )
+        self._key_rotation = (
+            PeriodicDatabaseKeyRotation(disk_store)
+            if disk_store is not None and disk_store.automatic_key_rotation_enabled
+            else None
         )
         self._started = False
         self._closed = False
@@ -58,6 +70,8 @@ class ResponsesStoreService:
             return
 
         self._cleanup.start()
+        if self._key_rotation is not None:
+            self._key_rotation.start()
         self._started = True
 
     async def close(self) -> None:
@@ -65,6 +79,8 @@ class ResponsesStoreService:
         if self._closed:
             return
 
+        if self._key_rotation is not None:
+            await self._key_rotation.stop()
         await self._cleanup.stop()
         await self._store.close()
         self._started = False
@@ -81,6 +97,10 @@ class ResponsesStoreService:
     @property
     def cleanup(self) -> PeriodicSessionStoreCleanup:
         return self._cleanup
+
+    @property
+    def key_rotation(self) -> PeriodicDatabaseKeyRotation | None:
+        return self._key_rotation
 
     @property
     def is_running(self) -> bool:

@@ -65,6 +65,7 @@ async def test_responses_store_service_starts_without_business_wiring(
         enable_responses_store=True,
         responses_store_disk_enabled=True,
         responses_store_disk_path=str(tmp_path / "responses.sqlite3"),
+        responses_store_key_file=None,
         responses_store_memory_capacity_mb=1,
         responses_store_disk_capacity_mb=2,
         responses_store_memory_low_watermark=0.5,

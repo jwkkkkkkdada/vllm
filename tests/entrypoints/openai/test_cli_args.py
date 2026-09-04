@@ -214,6 +214,34 @@ def test_per_request_metrics_requires_log_stats(serve_parser):
         validate_parsed_serve_args(args)
 
 
+def test_responses_store_recovery_args(serve_parser):
+    args = serve_parser.parse_args(
+        args=[
+            "--enable-responses-store",
+            "--responses-store-disk-path",
+            "/var/lib/vllm/responses.sqlite3",
+            "--responses-store-key-file",
+            "/run/secrets/vllm-responses-key",
+        ]
+    )
+
+    validate_parsed_serve_args(args)
+    assert args.responses_store_key_file == "/run/secrets/vllm-responses-key"
+
+
+def test_responses_store_recovery_requires_disk_path(serve_parser):
+    args = serve_parser.parse_args(
+        args=[
+            "--enable-responses-store",
+            "--responses-store-key-file",
+            "/run/secrets/vllm-responses-key",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="explicit disk path"):
+        validate_parsed_serve_args(args)
+
+
 @pytest.mark.parametrize(
     "cli_args, expected_middleware",
     [
