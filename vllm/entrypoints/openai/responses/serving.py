@@ -10,10 +10,6 @@ from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import Any, Final
 
-# 修改后
-from store.service import ResponsesStoreService
-from store.tiered import TieredSessionStore
-
 from fastapi import Request
 from openai.types.responses import (
     ResponseFunctionToolCall,
@@ -289,8 +285,6 @@ class OpenAIServingResponses(GenerateBaseServing):
         enable_force_include_usage: bool = False,
         enable_log_outputs: bool = False,
         default_chat_template_kwargs: dict[str, Any] | None = None,
-        # 增加一个可选参数
-        responses_store_service: ResponsesStoreService | None = None,
     ) -> None:
         super().__init__(
             engine_client=engine_client,
@@ -361,8 +355,6 @@ class OpenAIServingResponses(GenerateBaseServing):
         self.background_tasks: dict[str, asyncio.Task] = {}
 
         self.tool_server = tool_server
-
-        self.ResponsesStoreService = responses_store_service
 
     def _effective_chat_template_kwargs(
         self, request: ResponsesRequest
@@ -1807,14 +1799,24 @@ class OpenAIServingResponses(GenerateBaseServing):
                     response=final_response,
                 )
             )
-    async def delete_response_session(self, session_id: str) -> bool:
-        if self.store_service is None:
+    async def delete_response_session(
+        self,
+        session_id: str,
+        raw_request: Request,
+    ) -> bool:
+        store = self._resolve_session_store(raw_request)
+        if store is None:
             return False
-        store: TieredSessionStore = self.store_service.store
         return await store.delete(session_id)
 
-    async def get_response_session(self, session_id: str) -> bool:
-        if self.store_service is None:
-            return False
-        store: TieredSessionStore = self.store_service.store
-        return await store.exists(session_id)
+
+    async def get_response_session(
+            self,
+            session_id: str,
+            raw_request: Request,
+        ) -> bool:
+            store = self._resolve_session_store(raw_request)
+            if store is None:
+                return False
+
+            return await store.exists(session_id)

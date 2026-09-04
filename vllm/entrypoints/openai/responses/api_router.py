@@ -142,7 +142,6 @@ async def delete_response_session(
     raw_request: Request,
 ):
     handler = responses(raw_request)
-
     if handler is None:
         return JSONResponse(
             status_code=400,
@@ -153,9 +152,26 @@ async def delete_response_session(
                 }
             },
         )
-
-    deleted = await handler.delete_response_session(session_id)
-
+    try:
+        deleted = await handler.delete_response_session(
+            session_id=session_id,
+            raw_request=raw_request,
+        )
+    except Exception:
+        logger.exception(
+            "Failed to delete response session: %s",
+            session_id,
+        )
+        return JSONResponse(
+            status_code=500,
+            content={
+                "deleted": False,
+                "error": {
+                    "type": "internal_error",
+                    "message": "Failed to delete session.",
+                },
+            },
+        )
     if not deleted:
         return JSONResponse(
             status_code=404,
@@ -167,7 +183,6 @@ async def delete_response_session(
                 },
             },
         )
-
     return JSONResponse(
         status_code=200,
         content={
@@ -181,7 +196,6 @@ async def get_response_session(
     raw_request: Request,
 ):
     handler = responses(raw_request)
-
     if handler is None:
         return JSONResponse(
             status_code=400,
@@ -192,15 +206,16 @@ async def get_response_session(
                 }
             },
         )
-
     try:
-        exists = await handler.get_response_session(session_id)
+        exists = await handler.get_response_session(
+            session_id=session_id,
+            raw_request=raw_request,
+        )
     except Exception:
         logger.exception(
             "Failed to check response session: %s",
             session_id,
         )
-
         return JSONResponse(
             status_code=500,
             content={
@@ -210,13 +225,12 @@ async def get_response_session(
                 }
             },
         )
-
     return JSONResponse(
         status_code=200,
         content={
             "session_id": session_id,
-            "exists": bool(exists),
-        }
+            "exists": exists,
+        },
     )
 
 def attach_router(app: FastAPI):
