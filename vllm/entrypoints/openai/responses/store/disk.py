@@ -78,7 +78,7 @@ class SQLiteSessionStore(SessionStore):
     """
     SQLite 二级存储。
 
-    - 临时模式在构造时清空旧表；恢复模式校验密钥并重建版本索引。
+    - 构造时清空 Session 表；持久密钥模式保留密钥元数据和轮换周期。
     - save() 只写进程内 pending，不做 SQLite I/O。
     - 后台单 Writer 按时间窗口合并同一 Session 的多次 save。
     - Token ID 以独立 AES-GCM 帧加密，增量写入不解密历史数据。
@@ -101,7 +101,7 @@ class SQLiteSessionStore(SessionStore):
         write_interval_seconds: float = 0.05,
         key_provider: KeyProvider | None = None,
         metrics: ResponseStoreMetrics | None = None,
-        recover_existing: bool = False,
+        persistent_key: bool = False,
         key_rotation_interval_seconds: int = KEY_ROTATION_INTERVAL_SECONDS,
     ) -> None:
         if not db_path:
@@ -112,15 +112,15 @@ class SQLiteSessionStore(SessionStore):
             raise ValueError("write_interval_seconds must be greater than 0")
         if array.array(self._TOKEN_TYPECODE).itemsize != 4:
             raise RuntimeError("32-bit unsigned int array is required")
-        if recover_existing and key_provider is None:
-            raise ValueError("recover_existing requires a persistent key provider")
+        if persistent_key and key_provider is None:
+            raise ValueError("persistent_key requires a persistent key provider")
         if key_rotation_interval_seconds <= 0:
             raise ValueError("key_rotation_interval_seconds must be greater than 0")
 
         self._db_path = db_path
         self._disk_idle_ttl_seconds = disk_idle_ttl_seconds
         self._write_interval_seconds = write_interval_seconds
-        self._recover_existing = recover_existing
+        self._persistent_key = persistent_key
         self._key_rotation_interval_seconds = key_rotation_interval_seconds
         self._key_file_provider = (
             key_provider if isinstance(key_provider, FileKeyProvider) else None
@@ -257,7 +257,7 @@ class SQLiteSessionStore(SessionStore):
 
     @property
     def automatic_key_rotation_enabled(self) -> bool:
-        return self._recover_existing and self._key_file_provider is not None
+        return self._persistent_key and self._key_file_provider is not None
 
     async def rotate_key_if_due(self, now: int | None = None) -> bool:
         """Atomically re-encrypt the complete database when its key is due."""
@@ -541,24 +541,24 @@ class SQLiteSessionStore(SessionStore):
 
     def _initialize_database(self) -> None:
         cursor = self._conn.cursor()
-        recovered_count: int | None = None
+        key_managed_store_initialized = False
         pending_key_to_promote: bytes | None = None
         discard_pending_key = False
         try:
             cursor.execute("PRAGMA journal_mode=WAL")
             cursor.execute(
                 "PRAGMA synchronous=FULL"
-                if self._recover_existing
+                if self._persistent_key
                 else "PRAGMA synchronous=NORMAL"
             )
             cursor.execute("BEGIN IMMEDIATE")
 
-            if self._recover_existing:
+            if self._persistent_key:
                 (
-                    recovered_count,
                     pending_key_to_promote,
                     discard_pending_key,
-                ) = self._initialize_recoverable_database(cursor)
+                ) = self._initialize_key_managed_database(cursor)
+                key_managed_store_initialized = True
             else:
                 self._initialize_ephemeral_database(cursor)
             self._conn.commit()
@@ -581,10 +581,10 @@ class SQLiteSessionStore(SessionStore):
                     exc_info=True,
                 )
 
-        if recovered_count is not None:
+        if key_managed_store_initialized:
             logger.info(
-                "Recovered %d persisted Responses store sessions from %s",
-                recovered_count,
+                "Initialized Responses store with empty session state and "
+                "persistent key metadata in %s",
                 self._db_path,
             )
 
@@ -597,20 +597,14 @@ class SQLiteSessionStore(SessionStore):
         cursor.execute("DROP TABLE IF EXISTS session_state")
         self._create_session_state_table(cursor)
 
-    def _initialize_recoverable_database(
+    def _initialize_key_managed_database(
         self, cursor: sqlite3.Cursor
-    ) -> tuple[int, bytes | None, bool]:
+    ) -> tuple[bytes | None, bool]:
         metadata_exists = self._table_exists(cursor, "store_metadata")
-        session_state_exists = self._table_exists(cursor, "session_state")
         pending_key_to_promote: bytes | None = None
         discard_pending_key = False
 
         if metadata_exists:
-            if not session_state_exists:
-                raise RuntimeError(
-                    "Persistent Responses store is missing the session_state table"
-                )
-            self._validate_session_state_schema(cursor)
             (
                 pending_key_to_promote,
                 discard_pending_key,
@@ -618,23 +612,11 @@ class SQLiteSessionStore(SessionStore):
             self._migrate_store_metadata(cursor, int(time.time()))
             self._validate_store_metadata(cursor)
         else:
-            if session_state_exists:
-                self._validate_session_state_schema(cursor)
-                row = cursor.execute("SELECT 1 FROM session_state LIMIT 1").fetchone()
-                if row is not None:
-                    raise RuntimeError(
-                        "Existing Responses store data has no key metadata and "
-                        "cannot be safely recovered"
-                    )
-            else:
-                self._create_session_state_table(cursor)
             self._create_store_metadata(cursor)
 
-        return (
-            self._restore_version_index(cursor),
-            pending_key_to_promote,
-            discard_pending_key,
-        )
+        cursor.execute("DROP TABLE IF EXISTS session_state")
+        self._create_session_state_table(cursor)
+        return pending_key_to_promote, discard_pending_key
 
     @staticmethod
     def _table_exists(cursor: sqlite3.Cursor, table_name: str) -> bool:
@@ -784,52 +766,6 @@ class SQLiteSessionStore(SessionStore):
         except DataDecryptionError:
             return False
         return hmac.compare_digest(key_check, self._KEY_CHECK_PLAINTEXT)
-
-    @staticmethod
-    def _validate_session_state_schema(cursor: sqlite3.Cursor) -> None:
-        required_columns = {
-            "session_id",
-            "response_id",
-            "token_ids",
-            "created_at",
-            "updated_at",
-            "disk_idle_expires_at",
-            "disk_size_bytes",
-            "write_version",
-        }
-        columns = {
-            str(row[1])
-            for row in cursor.execute("PRAGMA table_info(session_state)").fetchall()
-        }
-        missing_columns = required_columns - columns
-        if missing_columns:
-            raise RuntimeError(
-                "Persistent Responses store has an incompatible session_state "
-                f"schema; missing columns: {sorted(missing_columns)}"
-            )
-
-    def _restore_version_index(self, cursor: sqlite3.Cursor) -> int:
-        rows = cursor.execute(
-            """
-            SELECT session_id, response_id, write_version
-            FROM session_state
-            """
-        ).fetchall()
-
-        for session_id_value, response_id_value, version_value in rows:
-            session_id = str(session_id_value)
-            response_id = str(response_id_value)
-            version = int(version_value)
-            if version <= 0:
-                raise RuntimeError(
-                    "Persistent Responses store contains an invalid write version"
-                )
-            self._latest_versions[session_id] = version
-            self._committed_versions[session_id] = version
-            self._latest_response_ids[session_id] = response_id
-            self._version_counter = max(self._version_counter, version)
-
-        return len(rows)
 
     def _rotate_key_if_due_sync(self, now: int) -> bool:
         key_provider = self._key_file_provider

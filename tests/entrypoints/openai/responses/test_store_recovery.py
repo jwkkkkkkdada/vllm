@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import asyncio
 import base64
 import sqlite3
 import time
@@ -40,8 +41,18 @@ def _store_args(db_path: Path, key_path: Path | None) -> Namespace:
     )
 
 
+async def _wait_for_disk_copy(service: ResponsesStoreService, session_id: str) -> None:
+    disk_store = service.store.disk_store
+    assert disk_store is not None
+    for _ in range(100):
+        if await disk_store.is_complete(session_id):
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("session was not persisted before the test deadline")
+
+
 @pytest.mark.asyncio
-async def test_persistent_store_recovers_index_and_appends_after_restart(
+async def test_restart_clears_sessions_but_preserves_key_metadata(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "responses.sqlite3"
@@ -54,25 +65,39 @@ async def test_persistent_store_recovers_index_and_appends_after_restart(
     assert first_service.key_rotation is not None
     assert first_service.key_rotation.is_running
     await first_service.store.save("session-1", "response-1", [10, 20])
+    await _wait_for_disk_copy(first_service, "session-1")
     await first_service.close()
 
-    second_service = ResponsesStoreService.from_cli_args(args)
-    second_service.start()
-    assert await second_service.store.exists("session-1")
-    assert await second_service.store.get("session-1") == [10, 20]
-    await second_service.store.save("session-1", "response-2", [30])
-    await second_service.close()
+    with sqlite3.connect(db_path) as connection:
+        original_metadata = connection.execute(
+            """
+            SELECT schema_version, key_check, key_rotated_at
+            FROM store_metadata WHERE singleton_id = 1
+            """
+        ).fetchone()
+        assert connection.execute("SELECT COUNT(*) FROM session_state").fetchone() == (
+            1,
+        )
 
-    third_service = ResponsesStoreService.from_cli_args(args)
-    third_service.start()
-    assert await third_service.store.get("session-1") == [10, 20, 30]
-    await third_service.close()
+    restarted_service = ResponsesStoreService.from_cli_args(args)
+    assert await restarted_service.store.get("session-1") is None
+    await restarted_service.close()
+
+    with sqlite3.connect(db_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM session_state").fetchone() == (
+            0,
+        )
+        current_metadata = connection.execute(
+            """
+            SELECT schema_version, key_check, key_rotated_at
+            FROM store_metadata WHERE singleton_id = 1
+            """
+        ).fetchone()
+    assert current_metadata == original_metadata
 
 
 @pytest.mark.asyncio
-async def test_wrong_key_fails_without_deleting_persisted_sessions(
-    tmp_path: Path,
-) -> None:
+async def test_wrong_key_fails_before_session_table_is_cleared(tmp_path: Path) -> None:
     db_path = tmp_path / "responses.sqlite3"
     key_path = tmp_path / "responses.key"
     original_key = b"a" * 32
@@ -81,22 +106,25 @@ async def test_wrong_key_fails_without_deleting_persisted_sessions(
 
     service = ResponsesStoreService.from_cli_args(args)
     await service.store.save("session-1", "response-1", [10, 20])
+    await _wait_for_disk_copy(service, "session-1")
     await service.close()
 
     _write_key_file(key_path, b"b" * 32)
     with pytest.raises(ValueError, match="key does not match"):
         ResponsesStoreService.from_cli_args(args)
+    with sqlite3.connect(db_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM session_state").fetchone() == (
+            1,
+        )
 
     _write_key_file(key_path, original_key)
-    recovered_service = ResponsesStoreService.from_cli_args(args)
-    assert await recovered_service.store.get("session-1") == [10, 20]
-    await recovered_service.close()
+    restarted_service = ResponsesStoreService.from_cli_args(args)
+    assert await restarted_service.store.get("session-1") is None
+    await restarted_service.close()
 
 
 @pytest.mark.asyncio
-async def test_ephemeral_mode_refuses_to_reset_persistent_database(
-    tmp_path: Path,
-) -> None:
+async def test_ephemeral_mode_refuses_persistent_key_metadata(tmp_path: Path) -> None:
     db_path = tmp_path / "responses.sqlite3"
     key_path = tmp_path / "responses.key"
     _write_key_file(key_path, b"a" * 32)
@@ -114,18 +142,13 @@ async def test_database_key_rotates_atomically_after_ninety_days(
 ) -> None:
     db_path = tmp_path / "responses.sqlite3"
     key_path = tmp_path / "responses.key"
-    original_key = b"a" * 32
-    _write_key_file(key_path, original_key)
-    args = _store_args(db_path, key_path)
+    _write_key_file(key_path, b"a" * 32)
+    service = ResponsesStoreService.from_cli_args(_store_args(db_path, key_path))
+    await service.store.save("session-1", "response-1", [10, 20])
+    await _wait_for_disk_copy(service, "session-1")
 
-    first_service = ResponsesStoreService.from_cli_args(args)
-    await first_service.store.save("session-1", "response-1", [10, 20])
-    await first_service.close()
-
-    rotating_service = ResponsesStoreService.from_cli_args(args)
-    disk_store = rotating_service.store.disk_store
+    disk_store = service.store.disk_store
     assert disk_store is not None
-
     before_rotation = key_path.read_bytes()
     assert not await disk_store.rotate_key_if_due(int(time.time()))
     assert key_path.read_bytes() == before_rotation
@@ -137,15 +160,14 @@ async def test_database_key_rotates_atomically_after_ninety_days(
     rotated_key_file = key_path.read_bytes()
     assert not await disk_store.rotate_key_if_due(rotation_time)
     assert key_path.read_bytes() == rotated_key_file
-    await rotating_service.close()
 
-    recovered_service = ResponsesStoreService.from_cli_args(args)
-    assert await recovered_service.store.get("session-1") == [10, 20]
-    await recovered_service.close()
+    await service.store.memory_store.delete("session-1")
+    assert await service.store.get("session-1") == [10, 20]
+    await service.close()
 
 
 @pytest.mark.asyncio
-async def test_committed_rotation_recovers_pending_key_after_interruption(
+async def test_committed_rotation_recovers_pending_key_but_clears_sessions(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -155,12 +177,10 @@ async def test_committed_rotation_recovers_pending_key_after_interruption(
     key_path.write_bytes(original_key_file)
     args = _store_args(db_path, key_path)
 
-    first_service = ResponsesStoreService.from_cli_args(args)
-    await first_service.store.save("session-1", "response-1", [10, 20])
-    await first_service.close()
-
-    rotating_service = ResponsesStoreService.from_cli_args(args)
-    disk_store = rotating_service.store.disk_store
+    service = ResponsesStoreService.from_cli_args(args)
+    await service.store.save("session-1", "response-1", [10, 20])
+    await _wait_for_disk_copy(service, "session-1")
+    disk_store = service.store.disk_store
     assert disk_store is not None
     key_provider = disk_store._key_file_provider
     assert key_provider is not None
@@ -175,25 +195,28 @@ async def test_committed_rotation_recovers_pending_key_after_interruption(
         await disk_store.rotate_key_if_due(rotation_time)
     assert key_path.read_bytes() == original_key_file
     assert key_path.with_name(f"{key_path.name}.pending").exists()
-    await rotating_service.close()
+    await service.close()
 
-    recovered_service = ResponsesStoreService.from_cli_args(args)
-    assert await recovered_service.store.get("session-1") == [10, 20]
+    restarted_service = ResponsesStoreService.from_cli_args(args)
+    assert await restarted_service.store.get("session-1") is None
     assert key_path.read_bytes() != original_key_file
     assert not key_path.with_name(f"{key_path.name}.pending").exists()
-    await recovered_service.close()
+    await restarted_service.close()
 
 
 @pytest.mark.asyncio
-async def test_recovery_migrates_pre_rotation_metadata(tmp_path: Path) -> None:
+async def test_restart_migrates_key_metadata_and_clears_legacy_sessions(
+    tmp_path: Path,
+) -> None:
     db_path = tmp_path / "responses.sqlite3"
     key_path = tmp_path / "responses.key"
     _write_key_file(key_path, b"a" * 32)
     args = _store_args(db_path, key_path)
 
-    first_service = ResponsesStoreService.from_cli_args(args)
-    await first_service.store.save("session-1", "response-1", [10, 20])
-    await first_service.close()
+    service = ResponsesStoreService.from_cli_args(args)
+    await service.store.save("session-1", "response-1", [10, 20])
+    await _wait_for_disk_copy(service, "session-1")
+    await service.close()
 
     with sqlite3.connect(db_path) as connection:
         connection.executescript(
@@ -210,9 +233,9 @@ async def test_recovery_migrates_pre_rotation_metadata(tmp_path: Path) -> None:
             """
         )
 
-    recovered_service = ResponsesStoreService.from_cli_args(args)
-    assert await recovered_service.store.get("session-1") == [10, 20]
-    await recovered_service.close()
+    restarted_service = ResponsesStoreService.from_cli_args(args)
+    assert await restarted_service.store.get("session-1") is None
+    await restarted_service.close()
 
     with sqlite3.connect(db_path) as connection:
         row = connection.execute(
@@ -221,9 +244,13 @@ async def test_recovery_migrates_pre_rotation_metadata(tmp_path: Path) -> None:
             FROM store_metadata WHERE singleton_id = 1
             """
         ).fetchone()
+        session_count = connection.execute(
+            "SELECT COUNT(*) FROM session_state"
+        ).fetchone()
     assert row is not None
     assert row[0] == 2
     assert row[1] is not None
+    assert session_count == (0,)
 
 
 @pytest.mark.asyncio
@@ -233,11 +260,9 @@ async def test_key_rotation_rolls_back_if_any_session_is_corrupt(
     db_path = tmp_path / "responses.sqlite3"
     key_path = tmp_path / "responses.key"
     _write_key_file(key_path, b"a" * 32)
-    args = _store_args(db_path, key_path)
-
-    first_service = ResponsesStoreService.from_cli_args(args)
-    await first_service.store.save("session-1", "response-1", [10, 20])
-    await first_service.close()
+    service = ResponsesStoreService.from_cli_args(_store_args(db_path, key_path))
+    await service.store.save("session-1", "response-1", [10, 20])
+    await _wait_for_disk_copy(service, "session-1")
 
     original_key_file = key_path.read_bytes()
     with sqlite3.connect(db_path) as connection:
@@ -249,8 +274,7 @@ async def test_key_rotation_rolls_back_if_any_session_is_corrupt(
             (b"corrupt", "session-1"),
         )
 
-    rotating_service = ResponsesStoreService.from_cli_args(args)
-    disk_store = rotating_service.store.disk_store
+    disk_store = service.store.disk_store
     assert disk_store is not None
     rotation_time = int(time.time()) + disk_store.KEY_ROTATION_INTERVAL_SECONDS + 1
     with pytest.raises(DataDecryptionError, match="Unable to rotate corrupted"):
@@ -263,4 +287,4 @@ async def test_key_rotation_rolls_back_if_any_session_is_corrupt(
             "SELECT key_check FROM store_metadata WHERE singleton_id = 1"
         ).fetchone()
     assert current_key_check == original_key_check
-    await rotating_service.close()
+    await service.close()

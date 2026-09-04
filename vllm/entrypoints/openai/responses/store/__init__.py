@@ -94,7 +94,7 @@ class ResponsesStoreConfig:
                 )
             if args.responses_store_disk_path == ":memory:":
                 raise ValueError(
-                    "responses store recovery requires a persistent disk path"
+                    "responses store key management requires a persistent disk path"
                 )
 
         memory_capacity_bytes = args.responses_store_memory_capacity_mb * _MIB
@@ -186,9 +186,9 @@ def add_responses_store_cli_args(
         default=None,
         help=(
             "File containing a Base64-encoded 32-byte AES-256 key. Providing "
-            "this option enables recovery from the explicitly configured "
-            "SQLite path and atomic database-wide key rotation every 90 days. "
-            "The file and its parent directory must be writable."
+            "this option preserves key metadata across restarts and enables "
+            "atomic database-wide key rotation every 90 days. Session data is "
+            "cleared on restart. The file and its parent directory must be writable."
         ),
     )
     group.add_argument(

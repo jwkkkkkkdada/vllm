@@ -35,7 +35,7 @@ class ResponsesStoreService:
                 write_interval_seconds=config.disk_write_interval_seconds,
                 key_provider=key_provider,
                 metrics=metrics,
-                recover_existing=config.key_file is not None,
+                persistent_key=config.key_file is not None,
             )
             if config.disk_enabled
             else None

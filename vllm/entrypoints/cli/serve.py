@@ -140,7 +140,7 @@ class ServeSubcommand(CLISubcommand):
             is_multi_port or args.api_server_count > 1
         ):
             raise ValueError(
-                "Persistent Responses store recovery currently supports exactly "
+                "Persistent Responses store key management supports exactly "
                 "one API server process"
             )
 

@@ -214,7 +214,7 @@ def test_per_request_metrics_requires_log_stats(serve_parser):
         validate_parsed_serve_args(args)
 
 
-def test_responses_store_recovery_args(serve_parser):
+def test_responses_store_key_management_args(serve_parser):
     args = serve_parser.parse_args(
         args=[
             "--enable-responses-store",
@@ -229,7 +229,7 @@ def test_responses_store_recovery_args(serve_parser):
     assert args.responses_store_key_file == "/run/secrets/vllm-responses-key"
 
 
-def test_responses_store_recovery_requires_disk_path(serve_parser):
+def test_responses_store_key_management_requires_disk_path(serve_parser):
     args = serve_parser.parse_args(
         args=[
             "--enable-responses-store",
