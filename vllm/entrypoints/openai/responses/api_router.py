@@ -136,7 +136,88 @@ async def cancel_responses(response_id: str, raw_request: Request):
             status_code=response.error.code,
         )
     return JSONResponse(content=response.model_dump(mode="json", by_alias=True))
+@router.delete("/session/delete")
+async def delete_response_session(
+    session_id: str,
+    raw_request: Request,
+):
+    handler = responses(raw_request)
 
+    if handler is None:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "type": "unsupported_api",
+                    "message": "Responses API is not supported.",
+                }
+            },
+        )
+
+    deleted = await handler.delete_response_session(session_id)
+
+    if not deleted:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "deleted": False,
+                "error": {
+                    "type": "session_not_found",
+                    "message": f"Session '{session_id}' was not found.",
+                },
+            },
+        )
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "session_id": session_id,
+            "deleted": True,
+        },
+    )
+@router.get("/session/get")
+async def get_response_session(
+    session_id: str,
+    raw_request: Request,
+):
+    handler = responses(raw_request)
+
+    if handler is None:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "type": "unsupported_api",
+                    "message": "Responses API is not supported.",
+                }
+            },
+        )
+
+    try:
+        exists = await handler.get_response_session(session_id)
+    except Exception:
+        logger.exception(
+            "Failed to check response session: %s",
+            session_id,
+        )
+
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": {
+                    "type": "internal_error",
+                    "message": "Failed to check session.",
+                }
+            },
+        )
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "session_id": session_id,
+            "exists": bool(exists),
+        }
+    )
 
 def attach_router(app: FastAPI):
     app.include_router(router)
