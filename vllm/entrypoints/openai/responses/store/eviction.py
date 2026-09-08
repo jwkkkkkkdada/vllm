@@ -40,7 +40,7 @@ class EvictionExecutionContext:
 
 @dataclass(frozen=True, slots=True)
 class EvictionCandidate:
-    """the snapshot of the candidate to be evicted"""
+    """Eviction candidate snapshot with timestamps in Unix milliseconds."""
     session_id: str
     response_id: str
     created_at: int
@@ -244,6 +244,8 @@ class EvictionPolicy:
         now: int,
     ) -> list[EvictionCandidate]:
         """
+        All timestamps, including now, are Unix milliseconds.
+
         The sorting rules are:
         1. Records that have expired in the current storage tier;
         2. Records with an earlier updated_at timestamp;

@@ -21,23 +21,25 @@ def _write_key_file(path: Path, key: bytes) -> None:
 
 def _store_args(db_path: Path, key_path: Path | None) -> Namespace:
     return Namespace(
-        enable_responses_store=True,
-        responses_store_disk_enabled=True,
         responses_store_disk_path=str(db_path),
         responses_store_key_file=None if key_path is None else str(key_path),
-        responses_store_memory_capacity_mb=1,
-        responses_store_disk_capacity_mb=2,
-        responses_store_memory_low_watermark=0.5,
-        responses_store_memory_high_watermark=0.8,
-        responses_store_disk_low_watermark=0.6,
-        responses_store_disk_high_watermark=0.9,
-        responses_store_memory_ttl_seconds=30,
-        responses_store_disk_ttl_seconds=60,
-        responses_store_cleanup_interval_seconds=60,
-        responses_store_cleanup_max_candidates=8,
-        responses_store_cleanup_max_bytes_mb=1,
-        responses_store_num_shards=4,
-        responses_store_disk_write_interval_seconds=0.01,
+        responses_store_config={
+            "enabled": True,
+            "disk_enabled": True,
+            "memory_capacity_mb": 1,
+            "disk_capacity_mb": 2,
+            "memory_low_watermark": 0.5,
+            "memory_high_watermark": 0.8,
+            "disk_low_watermark": 0.6,
+            "disk_high_watermark": 0.9,
+            "memory_ttl_seconds": 30,
+            "disk_ttl_seconds": 60,
+            "cleanup_interval_seconds": 60,
+            "cleanup_max_candidates": 8,
+            "cleanup_max_bytes_mb": 1,
+            "num_shards": 4,
+            "disk_write_interval_seconds": 0.01,
+        },
     )
 
 

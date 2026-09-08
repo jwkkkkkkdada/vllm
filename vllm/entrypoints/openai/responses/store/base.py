@@ -137,7 +137,7 @@ class DiskEvictionResult:
 
 @dataclass(slots=True)
 class SessionMetadata:
-    """Session fields needed for capacity and eviction decisions."""
+    """Session eviction metadata; all timestamps are Unix milliseconds."""
 
     session_id: str
     response_id: str
@@ -158,6 +158,7 @@ class SessionState:
     response_id: str
     token_ids: list[int]
 
+    # All timestamps, including idle expiry times, are Unix milliseconds.
     created_at: int
     updated_at: int
 

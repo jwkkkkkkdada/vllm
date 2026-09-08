@@ -217,7 +217,8 @@ def test_per_request_metrics_requires_log_stats(serve_parser):
 def test_responses_store_key_management_args(serve_parser):
     args = serve_parser.parse_args(
         args=[
-            "--enable-responses-store",
+            "--responses-store-config",
+            '{"enabled": true}',
             "--responses-store-disk-path",
             "/var/lib/vllm/responses.sqlite3",
             "--responses-store-key-file",
@@ -232,13 +233,26 @@ def test_responses_store_key_management_args(serve_parser):
 def test_responses_store_key_management_requires_disk_path(serve_parser):
     args = serve_parser.parse_args(
         args=[
-            "--enable-responses-store",
+            "--responses-store-config",
+            '{"enabled": true}',
             "--responses-store-key-file",
             "/run/secrets/vllm-responses-key",
         ]
     )
 
     with pytest.raises(ValueError, match="explicit disk path"):
+        validate_parsed_serve_args(args)
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_responses_store_config_validation(serve_parser, enabled):
+    args = serve_parser.parse_args(
+        args=[
+            "--responses-store-config",
+            json.dumps({"enabled": enabled, "num_shards": 0}),
+        ]
+    )
+    with pytest.raises(ValueError, match="num shards"):
         validate_parsed_serve_args(args)
 
 

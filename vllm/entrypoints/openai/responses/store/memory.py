@@ -39,7 +39,7 @@ class MemorySessionStore(SessionStore):
         delta_token_ids: list[int],
     ) -> None:
         state = self._data.get(session_id)
-        now = int(time.time())
+        now = time.time_ns() // 1_000_000
 
         if state is None:
             state = SessionState(
@@ -69,7 +69,7 @@ class MemorySessionStore(SessionStore):
         if state is None:
             return None
 
-        now = int(time.time())
+        now = time.time_ns() // 1_000_000
         state.updated_at = now
         state.mem_idle_expires_at = self._build_expire_time(now)
         return state.token_ids.copy()
@@ -163,7 +163,7 @@ class MemorySessionStore(SessionStore):
         if state.session_id in self._data:
             return False
 
-        now = int(time.time())
+        now = time.time_ns() // 1_000_000
         restored = self._copy_state(state)
         restored.updated_at = now
         restored.mem_idle_expires_at = self._build_expire_time(now)
@@ -193,7 +193,7 @@ class MemorySessionStore(SessionStore):
     def _build_expire_time(self, now: int) -> int | None:
         if self._mem_idle_ttl_seconds is None:
             return None
-        return now + self._mem_idle_ttl_seconds
+        return now + self._mem_idle_ttl_seconds * 1_000
 
     @classmethod
     def _estimate_state_size_bytes(cls, state: SessionState) -> int:

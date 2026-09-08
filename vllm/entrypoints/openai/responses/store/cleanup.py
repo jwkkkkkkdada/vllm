@@ -56,6 +56,8 @@ class PeriodicCleanupConfig:
 
 @dataclass(frozen=True, slots=True)
 class CleanupRunResult:
+    """Cleanup outcome with started_at in Unix milliseconds."""
+
     started_at: int
     duration_seconds: float
     scanned_session_count: int
@@ -133,7 +135,7 @@ class PeriodicSessionStoreCleanup:
     async def run_once(self) -> CleanupRunResult:
         """Build one snapshot and run at most one bounded batch per tier."""
         async with self._run_lock:
-            started_at = int(time.time())
+            started_at = time.time_ns() // 1_000_000
             started_monotonic = time.monotonic()
 
             records = await self._store.list_metadata()

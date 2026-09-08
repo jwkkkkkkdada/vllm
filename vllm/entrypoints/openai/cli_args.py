@@ -409,10 +409,9 @@ def validate_parsed_serve_args(args: argparse.Namespace):
             "logging; remove --disable-log-stats to enable per-request metrics."
         )
 
-    if getattr(args, "enable_responses_store", False):
-        from vllm.entrypoints.openai.responses.store import ResponsesStoreConfig
+    from vllm.entrypoints.openai.responses.store import ResponsesStoreConfig
 
-        ResponsesStoreConfig.from_cli_args(args)
+    ResponsesStoreConfig.from_cli_args(args)
 
     if args.data_parallel_multi_port_external_lb:
         from vllm.entrypoints.openai.dp_supervisor import (

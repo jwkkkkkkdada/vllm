@@ -176,7 +176,7 @@ class SQLiteSessionStore(SessionStore):
         """只进入 pending buffer；真正 SQLite I/O 由后台 Writer 完成。"""
         self._ensure_open()
         self._ensure_writer_started()
-        now = int(time.time())
+        now = time.time_ns() // 1_000_000
 
         async with self._meta_lock:
             version = self._allocate_version_locked()
@@ -207,7 +207,7 @@ class SQLiteSessionStore(SessionStore):
         """使用 Memory 完整快照重建 Disk 副本。"""
         self._ensure_open()
         self._ensure_writer_started()
-        now = int(time.time())
+        now = time.time_ns() // 1_000_000
 
         async with self._meta_lock:
             version = self._allocate_version_locked()
@@ -291,7 +291,7 @@ class SQLiteSessionStore(SessionStore):
                 self._read_state_sync,
                 session_id,
                 expected,
-                int(time.time()),
+                time.time_ns() // 1_000_000,
             )
 
             if read_result.corrupt_copy is not None:
@@ -1365,7 +1365,7 @@ class SQLiteSessionStore(SessionStore):
     def _build_expire_time(self, now: int) -> int | None:
         if self._disk_idle_ttl_seconds is None:
             return None
-        return now + self._disk_idle_ttl_seconds
+        return now + self._disk_idle_ttl_seconds * 1_000
 
     @classmethod
     def _encode_token_ids(cls, token_ids: list[int]) -> bytes:

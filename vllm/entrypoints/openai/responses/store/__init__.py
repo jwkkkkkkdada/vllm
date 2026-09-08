@@ -10,9 +10,11 @@ register with vLLM's global parser, create stores, or start cleanup tasks.
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import os
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -20,6 +22,53 @@ if TYPE_CHECKING:
     from .cleanup import PeriodicCleanupConfig
 
 _MIB = 1024 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class ResponsesStoreOptions:
+    """User-facing settings accepted by ``--responses-store-config``.
+
+    Capacities and cleanup budgets use MiB. Watermarks are capacity ratios.
+    TTLs and intervals use seconds; a zero TTL disables expiration.
+    """
+
+    enabled: bool = False
+    disk_enabled: bool = True
+    memory_capacity_mb: int = 512
+    disk_capacity_mb: int = 4096
+    memory_low_watermark: float = 0.6
+    memory_high_watermark: float = 0.8
+    disk_low_watermark: float = 0.7
+    disk_high_watermark: float = 0.9
+    memory_ttl_seconds: int = 300
+    disk_ttl_seconds: int = 3600
+    cleanup_interval_seconds: float = 30.0
+    cleanup_max_candidates: int = 128
+    cleanup_max_bytes_mb: int = 512
+    num_shards: int = 64
+    disk_write_interval_seconds: float = 0.05
+
+    @classmethod
+    def from_dict(cls, value: object) -> ResponsesStoreOptions:
+        if not isinstance(value, dict):
+            raise ValueError("responses store config must be a JSON object")
+        defaults = {field.name: field.default for field in fields(cls)}
+        for name, setting in value.items():
+            if name not in defaults:
+                raise ValueError(f"unknown responses store config field: {name}")
+            expected = type(defaults[name])
+            valid = (
+                type(setting) in (int, float)
+                if expected is float
+                else type(setting) is expected
+            )
+            if not valid:
+                raise ValueError(
+                    f"responses store config {name} must be {expected.__name__}"
+                )
+            if isinstance(setting, float) and not math.isfinite(setting):
+                raise ValueError(f"responses store config {name} must be finite")
+        return cls(**value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,86 +96,75 @@ class ResponsesStoreConfig:
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace) -> ResponsesStoreConfig:
         """Convert CLI-friendly units into the store's internal units."""
-        if (
-            args.responses_store_memory_capacity_mb <= 0
-            or args.responses_store_disk_capacity_mb <= 0
-        ):
+        value = getattr(args, "responses_store_config", None)
+        options = ResponsesStoreOptions.from_dict({} if value is None else value)
+        disk_path = getattr(args, "responses_store_disk_path", None)
+        if options.memory_capacity_mb <= 0 or options.disk_capacity_mb <= 0:
             raise ValueError("responses store capacities must be greater than 0")
         if not (
-            0
-            <= args.responses_store_memory_low_watermark
-            < args.responses_store_memory_high_watermark
-            <= 1
+            0 <= options.memory_low_watermark < options.memory_high_watermark <= 1
         ) or not (
-            0
-            <= args.responses_store_disk_low_watermark
-            < args.responses_store_disk_high_watermark
-            <= 1
+            0 <= options.disk_low_watermark < options.disk_high_watermark <= 1
         ):
             raise ValueError(
                 "responses store watermarks must satisfy 0 <= low < high <= 1"
             )
-        if (
-            args.responses_store_memory_ttl_seconds < 0
-            or args.responses_store_disk_ttl_seconds < 0
-        ):
+        if options.memory_ttl_seconds < 0 or options.disk_ttl_seconds < 0:
             raise ValueError("responses store TTL must be non-negative")
-        if args.responses_store_cleanup_interval_seconds <= 0:
+        if options.cleanup_interval_seconds <= 0:
             raise ValueError("cleanup interval must be greater than 0")
-        if args.responses_store_cleanup_max_candidates <= 0:
+        if options.cleanup_max_candidates <= 0:
             raise ValueError("cleanup max candidates must be greater than 0")
-        if args.responses_store_cleanup_max_bytes_mb <= 0:
+        if options.cleanup_max_bytes_mb <= 0:
             raise ValueError("cleanup max bytes must be greater than 0")
-        if args.responses_store_num_shards <= 0:
+        if options.num_shards <= 0:
             raise ValueError("responses store num shards must be greater than 0")
-        if args.responses_store_disk_write_interval_seconds <= 0:
+        if options.disk_write_interval_seconds <= 0:
             raise ValueError("disk write interval must be greater than 0")
 
         key_file = getattr(args, "responses_store_key_file", None)
         if key_file is not None:
-            if not getattr(args, "responses_store_disk_enabled", True):
+            if not options.disk_enabled:
                 raise ValueError(
                     "responses store key file requires the disk tier to be enabled"
                 )
-            if not args.responses_store_disk_path:
+            if not disk_path:
                 raise ValueError(
                     "responses store key file requires an explicit disk path"
                 )
-            if args.responses_store_disk_path == ":memory:":
+            if disk_path == ":memory:":
                 raise ValueError(
                     "responses store key management requires a persistent disk path"
                 )
 
-        memory_capacity_bytes = args.responses_store_memory_capacity_mb * _MIB
-        disk_capacity_bytes = args.responses_store_disk_capacity_mb * _MIB
+        memory_capacity_bytes = options.memory_capacity_mb * _MIB
+        disk_capacity_bytes = options.disk_capacity_mb * _MIB
 
         return cls(
-            enabled=args.enable_responses_store,
-            disk_path=args.responses_store_disk_path or _default_disk_path(),
+            enabled=options.enabled,
+            disk_path=disk_path or _default_disk_path(),
             memory_capacity_bytes=memory_capacity_bytes,
             disk_capacity_bytes=disk_capacity_bytes,
             memory_low_watermark_bytes=int(
-                memory_capacity_bytes * args.responses_store_memory_low_watermark
+                memory_capacity_bytes * options.memory_low_watermark
             ),
             memory_high_watermark_bytes=int(
-                memory_capacity_bytes * args.responses_store_memory_high_watermark
+                memory_capacity_bytes * options.memory_high_watermark
             ),
             disk_low_watermark_bytes=int(
-                disk_capacity_bytes * args.responses_store_disk_low_watermark
+                disk_capacity_bytes * options.disk_low_watermark
             ),
             disk_high_watermark_bytes=int(
-                disk_capacity_bytes * args.responses_store_disk_high_watermark
+                disk_capacity_bytes * options.disk_high_watermark
             ),
-            memory_ttl_seconds=args.responses_store_memory_ttl_seconds or None,
-            disk_ttl_seconds=args.responses_store_disk_ttl_seconds or None,
-            cleanup_interval_seconds=args.responses_store_cleanup_interval_seconds,
-            cleanup_max_candidates=args.responses_store_cleanup_max_candidates,
-            cleanup_max_bytes=args.responses_store_cleanup_max_bytes_mb * _MIB,
-            num_shards=args.responses_store_num_shards,
-            disk_write_interval_seconds=(
-                args.responses_store_disk_write_interval_seconds
-            ),
-            disk_enabled=getattr(args, "responses_store_disk_enabled", True),
+            memory_ttl_seconds=options.memory_ttl_seconds or None,
+            disk_ttl_seconds=options.disk_ttl_seconds or None,
+            cleanup_interval_seconds=options.cleanup_interval_seconds,
+            cleanup_max_candidates=options.cleanup_max_candidates,
+            cleanup_max_bytes=options.cleanup_max_bytes_mb * _MIB,
+            num_shards=options.num_shards,
+            disk_write_interval_seconds=options.disk_write_interval_seconds,
+            disk_enabled=options.disk_enabled,
             key_file=key_file,
         )
 
@@ -166,15 +204,21 @@ def add_responses_store_cli_args(
     """Register Responses token-store arguments without starting the store."""
     group = parser.add_argument_group("Responses token store")
     group.add_argument(
-        "--enable-responses-store",
-        action="store_true",
-        help="Enable the Responses token store when integrated by the server.",
-    )
-    group.add_argument(
-        "--responses-store-disk-enabled",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Enable SQLite as the Responses store's secondary storage tier.",
+        "--responses-store-config",
+        type=json.loads,
+        default=None,
+        help=(
+            "Responses token store settings as a JSON object. "
+            'Use {"enabled": true} to enable the store. '
+            "Keys and defaults: "
+            + json.dumps(
+                {field.name: field.default for field in fields(ResponsesStoreOptions)}
+            )
+            + ". Capacities and cleanup_max_bytes_mb use MiB; watermarks are "
+            "capacity ratios; TTLs and intervals use seconds (TTL 0 disables "
+            "expiration). Capacity targets trigger cleanup, not write rejection. "
+            "Set disk_path and key_file using their separate CLI options."
+        ),
     )
     group.add_argument(
         "--responses-store-disk-path",
@@ -191,90 +235,6 @@ def add_responses_store_cli_args(
             "cleared on restart. The file and its parent directory must be writable."
         ),
     )
-    group.add_argument(
-        "--responses-store-memory-capacity-mb",
-        type=int,
-        default=512,
-        help=(
-            "Memory capacity target for periodic cleanup, in MiB; "
-            "writes are not rejected."
-        ),
-    )
-    group.add_argument(
-        "--responses-store-disk-capacity-mb",
-        type=int,
-        default=4096,
-        help=(
-            "Disk capacity target for periodic cleanup, in MiB; "
-            "writes are not rejected."
-        ),
-    )
-    group.add_argument(
-        "--responses-store-memory-low-watermark",
-        type=float,
-        default=0.6,
-        help="Memory cleanup target as a capacity ratio.",
-    )
-    group.add_argument(
-        "--responses-store-memory-high-watermark",
-        type=float,
-        default=0.8,
-        help="Memory pressure trigger as a capacity ratio.",
-    )
-    group.add_argument(
-        "--responses-store-disk-low-watermark",
-        type=float,
-        default=0.7,
-        help="Disk cleanup target as a capacity ratio.",
-    )
-    group.add_argument(
-        "--responses-store-disk-high-watermark",
-        type=float,
-        default=0.9,
-        help="Disk pressure trigger as a capacity ratio.",
-    )
-    group.add_argument(
-        "--responses-store-memory-ttl-seconds",
-        type=int,
-        default=300,
-        help="Memory idle TTL in seconds; 0 disables it.",
-    )
-    group.add_argument(
-        "--responses-store-disk-ttl-seconds",
-        type=int,
-        default=3600,
-        help="Disk idle TTL in seconds; 0 disables it.",
-    )
-    group.add_argument(
-        "--responses-store-cleanup-interval-seconds",
-        type=float,
-        default=30.0,
-        help="Interval between periodic cleanup runs.",
-    )
-    group.add_argument(
-        "--responses-store-cleanup-max-candidates",
-        type=int,
-        default=128,
-        help="Maximum candidates processed per tier and cleanup run.",
-    )
-    group.add_argument(
-        "--responses-store-cleanup-max-bytes-mb",
-        type=int,
-        default=512,
-        help="Maximum planned bytes reclaimed per tier and run, in MiB.",
-    )
-    group.add_argument(
-        "--responses-store-num-shards",
-        type=int,
-        default=64,
-        help="Number of per-session lock shards.",
-    )
-    group.add_argument(
-        "--responses-store-disk-write-interval-seconds",
-        type=float,
-        default=0.05,
-        help="Disk writer batching interval in seconds.",
-    )
     return parser
 
 
@@ -286,5 +246,6 @@ def _default_disk_path() -> str:
 
 __all__ = [
     "ResponsesStoreConfig",
+    "ResponsesStoreOptions",
     "add_responses_store_cli_args",
 ]
