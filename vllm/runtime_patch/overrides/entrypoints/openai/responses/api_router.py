@@ -30,6 +30,15 @@ router = APIRouter()
 def responses(request: Request) -> OpenAIServingResponses | None:
     return request.app.state.openai_serving_responses
 
+def _response_headers(
+    request: ResponsesRequest,
+    raw_request: Request,
+) -> dict[str, str]:
+    headers = {"response_id": request.request_id}
+    if session_id := raw_request.headers.get("x-session-id"):
+        headers["x-session-id"] = session_id
+    return headers
+
 
 async def _convert_stream_to_sse_events(
     generator: AsyncGenerator[StreamingResponsesResponse, None],
@@ -53,6 +62,7 @@ async def _convert_stream_to_sse_events(
         HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
         HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
         HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
+        HTTPStatus.SERVICE_UNAVAILABLE.value: {"model": ErrorResponse},
     },
 )
 @with_cancellation
@@ -63,17 +73,21 @@ async def create_responses(request: ResponsesRequest, raw_request: Request):
         raise NotImplementedError("The model does not support Responses API")
 
     generator = await handler.create_responses(request, raw_request)
+    response_headers = _response_headers(request, raw_request)
 
     if isinstance(generator, ErrorResponse):
         return JSONResponse(
             content=generator.model_dump(mode="json", by_alias=True),
             status_code=generator.error.code,
+            headers=response_headers,
         )
     elif isinstance(generator, ResponsesResponse):
-        return JSONResponse(content=generator.model_dump(mode="json", by_alias=True))
+        return JSONResponse(content=generator.model_dump(mode="json", by_alias=True), headers=response_headers)
 
     return StreamingResponse(
-        content=_convert_stream_to_sse_events(generator), media_type="text/event-stream"
+        content=_convert_stream_to_sse_events(generator),
+        media_type="text/event-stream",
+        headers=response_headers,
     )
 
 
@@ -122,7 +136,102 @@ async def cancel_responses(response_id: str, raw_request: Request):
             status_code=response.error.code,
         )
     return JSONResponse(content=response.model_dump(mode="json", by_alias=True))
-
+@router.delete("/session/delete")
+async def delete_response_session(
+    session_id: str,
+    raw_request: Request,
+):
+    handler = responses(raw_request)
+    if handler is None:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "type": "unsupported_api",
+                    "message": "Responses API is not supported.",
+                }
+            },
+        )
+    try:
+        deleted = await handler.delete_response_session(
+            session_id=session_id,
+            raw_request=raw_request,
+        )
+    except Exception:
+        logger.exception(
+            "Failed to delete response session: %s",
+            session_id,
+        )
+        return JSONResponse(
+            status_code=500,
+            content={
+                "deleted": False,
+                "error": {
+                    "type": "internal_error",
+                    "message": "Failed to delete session.",
+                },
+            },
+        )
+    if not deleted:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "deleted": False,
+                "error": {
+                    "type": "session_not_found",
+                    "message": f"Session '{session_id}' was not found.",
+                },
+            },
+        )
+    return JSONResponse(
+        status_code=200,
+        content={
+            "session_id": session_id,
+            "deleted": True,
+        },
+    )
+@router.get("/session/get")
+async def get_response_session(
+    session_id: str,
+    raw_request: Request,
+):
+    handler = responses(raw_request)
+    if handler is None:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "type": "unsupported_api",
+                    "message": "Responses API is not supported.",
+                }
+            },
+        )
+    try:
+        exists = await handler.get_response_session(
+            session_id=session_id,
+            raw_request=raw_request,
+        )
+    except Exception:
+        logger.exception(
+            "Failed to check response session: %s",
+            session_id,
+        )
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": {
+                    "type": "internal_error",
+                    "message": "Failed to check session.",
+                }
+            },
+        )
+    return JSONResponse(
+        status_code=200,
+        content={
+            "session_id": session_id,
+            "exists": exists,
+        },
+    )
 
 def attach_router(app: FastAPI):
     app.include_router(router)

@@ -4,6 +4,7 @@
 from unittest.mock import patch
 
 import pytest
+from openai.types.responses import NamespaceTool
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
 from openai.types.responses.response_function_tool_call_output_item import (
     ResponseFunctionToolCallOutputItem,
@@ -16,13 +17,18 @@ from openai.types.responses.response_reasoning_item import (
     Summary,
 )
 
+from vllm.entrypoints.openai.engine.protocol import FunctionCall
 from vllm.entrypoints.openai.responses.utils import (
     _construct_message_from_response_item,
+    build_response_output_items,
     construct_chat_messages_with_tool_call,
     construct_input_messages,
+    construct_tool_dicts,
     convert_tool_responses_to_completions_format,
+    extract_custom_tool_names,
     should_continue_final_message,
 )
+from vllm.tool_parsers.utils import build_responses_tool_call_name_map
 
 
 def _single_chat_message(item):
@@ -137,6 +143,76 @@ class TestResponsesUtils:
         result = convert_tool_responses_to_completions_format(input_tool)
 
         assert result == {"type": "function", "function": input_tool}
+
+    def test_construct_custom_tool_dict_has_no_duplicate(self):
+        namespace = NamespaceTool(
+            type="namespace",
+            name="editing",
+            description="Editing tools.",
+            tools=[{"type": "custom", "name": "apply_patch"}],
+        )
+        custom_tool = namespace.tools[0]
+
+        result = construct_tool_dicts([custom_tool], "auto")
+
+        assert result is not None
+        assert len(result) == 1
+        assert result[0]["function"]["name"] == "apply_patch"
+        assert result[0]["function"]["parameters"]["required"] == ["input"]
+
+    def test_construct_namespaced_custom_tool_dict(self):
+        namespace = NamespaceTool(
+            type="namespace",
+            name="editing",
+            description="Editing tools.",
+            tools=[{"type": "custom", "name": "apply_patch"}],
+        )
+
+        result = construct_tool_dicts([namespace], "auto")
+        name_map = build_responses_tool_call_name_map([namespace])
+
+        assert result is not None
+        assert len(result) == 1
+        assert result[0]["function"]["name"] == "editing__apply_patch"
+        assert extract_custom_tool_names([namespace]) == {
+            "editing__apply_patch"
+        }
+        assert name_map["editing__apply_patch"].name == "apply_patch"
+        assert name_map["editing__apply_patch"].namespace == "editing"
+
+        output = build_response_output_items(
+            reasoning=None,
+            content=None,
+            tool_calls=[
+                FunctionCall(
+                    name="editing__apply_patch",
+                    arguments='{"input":"patch text"}',
+                    id="call_1",
+                )
+            ],
+            tools=[namespace],
+        )[0]
+        assert output.type == "custom_tool_call"
+        assert output.name == "apply_patch"
+        assert output.namespace == "editing"
+        assert output.input == "patch text"
+
+    def test_namespaced_custom_tool_history_is_flattened(self):
+        message = _single_chat_message(
+            {
+                "type": "custom_tool_call",
+                "call_id": "call_1",
+                "name": "apply_patch",
+                "namespace": "editing",
+                "input": "patch text",
+            }
+        )
+
+        tool_call = message["tool_calls"][0]
+        assert tool_call["function"]["name"] == "editing__apply_patch"
+        assert tool_call["function"]["arguments"] == (
+            '{"input": "patch text"}'
+        )
 
     def test_construct_chat_messages_with_tool_call(self):
         """Test construction of chat messages with tool calls."""

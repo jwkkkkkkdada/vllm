@@ -205,7 +205,9 @@ def iter_response_function_tool_dicts(
 ) -> list[dict[str, Any]]:
     function_tools: list[dict[str, Any]] = []
     for tool in tools:
-        if isinstance(tool, NamespaceTool):
+        if isinstance(tool, FunctionTool):
+            function_tools.append(tool.model_dump())
+        elif isinstance(tool, NamespaceTool):
             namespace = tool.name
             for namespaced_tool in tool.tools:
                 if namespaced_tool.type != "function":
@@ -215,8 +217,6 @@ def iter_response_function_tool_dicts(
                     namespace, namespaced_tool.name
                 )
                 function_tools.append(tool_dict)
-        else:
-            function_tools.append(tool.model_dump())
     return function_tools
 
 
@@ -232,7 +232,7 @@ def build_responses_tool_call_name_map(
             continue
         namespace = tool.name
         for namespaced_tool in tool.tools:
-            if namespaced_tool.type != "function":
+            if namespaced_tool.type not in ("function", "custom"):
                 continue
             flat_name = flat_namespace_tool_name(namespace, namespaced_tool.name)
             name_map[flat_name] = ResponsesToolCallName(

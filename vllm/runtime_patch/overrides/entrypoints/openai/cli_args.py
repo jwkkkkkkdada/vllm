@@ -145,7 +145,7 @@ class BaseFrontendArgs:
     Requires `--enable-log-requests`. As with `--enable-log-requests`,
     information is only logged at INFO level at maximum."""
     enable_log_deltas: bool = True
-    """If set to False, output deltas will not be logged. Relevant only if 
+    """If set to False, output deltas will not be logged. Relevant only if
     --enable-log-outputs is set.
     """
     log_error_stack: bool = envs.VLLM_SERVER_DEV_MODE
@@ -380,6 +380,10 @@ def make_arg_parser(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
     parser = FrontendArgs.add_cli_args(parser)
     parser = AsyncEngineArgs.add_cli_args(parser)
 
+    from vllm.entrypoints.openai.responses.store import add_responses_store_cli_args
+
+    add_responses_store_cli_args(parser)
+
     return parser
 
 
@@ -404,6 +408,10 @@ def validate_parsed_serve_args(args: argparse.Namespace):
             "Error: --enable-per-request-metrics requires engine statistics "
             "logging; remove --disable-log-stats to enable per-request metrics."
         )
+
+    from vllm.entrypoints.openai.responses.store import ResponsesStoreConfig
+
+    ResponsesStoreConfig.from_cli_args(args)
 
     if args.data_parallel_multi_port_external_lb:
         from vllm.entrypoints.openai.dp_supervisor import (

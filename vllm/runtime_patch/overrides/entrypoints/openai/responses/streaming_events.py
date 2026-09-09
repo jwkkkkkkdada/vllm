@@ -16,6 +16,7 @@ The file is organized as:
 """
 
 import json
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -30,6 +31,10 @@ from openai.types.responses import (
     ResponseCodeInterpreterToolCallParam,
     ResponseContentPartAddedEvent,
     ResponseContentPartDoneEvent,
+    ResponseCustomToolCall,
+    ResponseCustomToolCallInputDeltaEvent,
+    ResponseCustomToolCallInputDoneEvent,
+    ResponseCustomToolCallItem,
     ResponseFunctionCallArgumentsDeltaEvent,
     ResponseFunctionCallArgumentsDoneEvent,
     ResponseFunctionToolCall,
@@ -74,6 +79,7 @@ from vllm.entrypoints.openai.responses.protocol import (
 )
 from vllm.entrypoints.openai.responses.utils import (
     build_responses_tool_call_name_map,
+    extract_custom_tool_names,
     resolve_responses_tool_call_name,
 )
 from vllm.outputs import CompletionOutput
@@ -823,6 +829,8 @@ class SimpleStreamingState:
     tool_call_namespace: str | None = None
     tool_call_index: int | None = None
     has_emitted_tool_call_delta: bool = False
+    is_custom_tool_call: bool = False
+    custom_unwrapped: str = ""
     current_state: _StateType = field(default_factory=lambda: _StateType.NONE)
 
 
@@ -1032,6 +1040,7 @@ def emit_simple_tool_call_open(
     state.tool_call_index = index
     state.accumulated_text = ""
     state.has_emitted_tool_call_delta = False
+    state.is_custom_tool_call = False
     return [
         ResponseOutputItemAddedEvent(
             type="response.output_item.added",
@@ -1100,6 +1109,207 @@ def emit_simple_tool_call_done(
     )
     state.output_index += 1
     state.tool_call_namespace = None
+    state.is_custom_tool_call = False
+    state.current_state = _StateType.NONE
+    return events
+
+
+_CUSTOM_INPUT_PREFIX = re.compile(r'^\s*\{\s*"input"\s*:\s*"')
+_JSON_ESCAPE_MAP = {
+    '"': '"',
+    "\\": "\\",
+    "/": "/",
+    "b": "\b",
+    "f": "\f",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+}
+
+
+def _decode_custom_input_prefix(raw: str) -> str:
+    """Decode the complete portion of a streamed JSON ``input`` string."""
+    match = _CUSTOM_INPUT_PREFIX.match(raw)
+    if match is None:
+        return ""
+
+    i = match.end()
+    out: list[str] = []
+    while i < len(raw):
+        ch = raw[i]
+        if ch == '"':
+            break
+        if ch != "\\":
+            if ord(ch) < 0x20:
+                break
+            out.append(ch)
+            i += 1
+            continue
+
+        if i + 1 >= len(raw):
+            break
+        escape = raw[i + 1]
+        if escape in _JSON_ESCAPE_MAP:
+            out.append(_JSON_ESCAPE_MAP[escape])
+            i += 2
+            continue
+        if escape != "u" or i + 6 > len(raw):
+            break
+
+        digits = raw[i + 2 : i + 6]
+        if any(char not in "0123456789abcdefABCDEF" for char in digits):
+            break
+        codepoint = int(digits, 16)
+        if 0xD800 <= codepoint <= 0xDBFF:
+            if i + 12 > len(raw) or raw[i + 6 : i + 8] != "\\u":
+                break
+            low_digits = raw[i + 8 : i + 12]
+            if any(
+                char not in "0123456789abcdefABCDEF" for char in low_digits
+            ):
+                break
+            low = int(low_digits, 16)
+            if not 0xDC00 <= low <= 0xDFFF:
+                break
+            combined = 0x10000 + ((codepoint - 0xD800) << 10) + (low - 0xDC00)
+            out.append(chr(combined))
+            i += 12
+            continue
+        if 0xDC00 <= codepoint <= 0xDFFF:
+            break
+        out.append(chr(codepoint))
+        i += 6
+
+    return "".join(out)
+
+
+def _unwrap_custom_tool_input(raw: str) -> str:
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return _decode_custom_input_prefix(raw)
+    if isinstance(value, dict):
+        value = value.get("input", raw)
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False)
+
+
+def emit_simple_custom_tool_call_open(
+    state: SimpleStreamingState,
+    name: str,
+    index: int | None,
+    namespace: str | None = None,
+) -> list[StreamingResponsesResponse]:
+    """打开一个 custom 工具调用：推送 custom_tool_call item（in_progress）。"""
+    state.current_state = _StateType.TOOL_CALL
+    state.current_item_id = random_uuid()
+    state.tool_call_id = f"call_{random_uuid()}"
+    state.tool_call_name = name
+    state.tool_call_namespace = namespace
+    state.tool_call_index = index
+    state.accumulated_text = ""
+    state.has_emitted_tool_call_delta = False
+    state.is_custom_tool_call = True
+    state.custom_unwrapped = ""
+    return [
+        ResponseOutputItemAddedEvent(
+            type="response.output_item.added",
+            sequence_number=-1,
+            output_index=state.output_index,
+            item=ResponseCustomToolCallItem(
+                type="custom_tool_call",
+                id=state.current_item_id,
+                call_id=state.tool_call_id,
+                name=name,
+                namespace=namespace,
+                input="",
+                status="in_progress",
+            ),
+        ),
+    ]
+
+
+def emit_simple_custom_tool_call_delta(
+    state: SimpleStreamingState,
+    delta: str,
+) -> list[StreamingResponsesResponse]:
+    """发送 custom 工具的自由文本增量（还原转义后的纯文本），而非模型的包装 JSON 片段。
+
+    增量 = 当前已还原纯文本 - 上一次已还原纯文本；客户端把所有 delta 拼接后
+    恰等于 done.input（真实换行/引号，而非字面 \\n/\\"）。
+    """
+    state.accumulated_text += delta
+    decoded = _decode_custom_input_prefix(state.accumulated_text)
+    if not decoded.startswith(state.custom_unwrapped):
+        return []
+    inc = decoded[len(state.custom_unwrapped) :]
+    if not inc:
+        return []
+    state.custom_unwrapped = decoded
+    state.has_emitted_tool_call_delta = True
+    return [
+        ResponseCustomToolCallInputDeltaEvent(
+            type="response.custom_tool_call_input.delta",
+            sequence_number=-1,
+            output_index=state.output_index,
+            item_id=state.current_item_id,
+            delta=inc,
+        )
+    ]
+
+
+def emit_simple_custom_tool_call_done(
+    state: SimpleStreamingState,
+) -> list[StreamingResponsesResponse]:
+    """结束 custom 工具调用：custom_tool_call_input.done(input=还原后纯文本) + output_item.done。
+
+    input 与 delta 使用同一解码规则，保证与客户端拼接结果一致。
+    """
+    events: list[StreamingResponsesResponse] = []
+    unwrapped = _unwrap_custom_tool_input(state.accumulated_text)
+    if unwrapped.startswith(state.custom_unwrapped):
+        remaining = unwrapped[len(state.custom_unwrapped) :]
+        if remaining:
+            events.append(
+                ResponseCustomToolCallInputDeltaEvent(
+                    type="response.custom_tool_call_input.delta",
+                    sequence_number=-1,
+                    output_index=state.output_index,
+                    item_id=state.current_item_id,
+                    delta=remaining,
+                )
+            )
+            state.has_emitted_tool_call_delta = True
+    state.custom_unwrapped = unwrapped
+    if state.accumulated_text:
+        events.append(
+            ResponseCustomToolCallInputDoneEvent(
+                type="response.custom_tool_call_input.done",
+                sequence_number=-1,
+                output_index=state.output_index,
+                item_id=state.current_item_id,
+                input=state.custom_unwrapped,
+            )
+        )
+    events.append(
+        ResponseOutputItemDoneEvent(
+            type="response.output_item.done",
+            sequence_number=-1,
+            output_index=state.output_index,
+            item=ResponseCustomToolCall(
+                type="custom_tool_call",
+                name=state.tool_call_name,
+                id=state.current_item_id,
+                call_id=state.tool_call_id,
+                input=state.custom_unwrapped,
+                namespace=state.tool_call_namespace,
+            ),
+        ),
+    )
+    state.output_index += 1
+    state.tool_call_namespace = None
+    state.is_custom_tool_call = False
     state.current_state = _StateType.NONE
     return events
 
@@ -1184,6 +1394,7 @@ class SimpleStreamingEventProcessor:
     ) -> None:
         self.state = state or SimpleStreamingState()
         self.tool_call_name_map = build_responses_tool_call_name_map(tools)
+        self.custom_tool_names = extract_custom_tool_names(tools)
 
     def resolve_target_state(
         self, delta_message: DeltaMessage
@@ -1229,6 +1440,11 @@ class SimpleStreamingEventProcessor:
     def close_current(self) -> list[StreamingResponsesResponse]:
         """Close the current state and emit its 'done' event sequence."""
         handlers = self._STATE_HANDLERS.get(self.state.current_state)
+        if (
+            self.state.current_state == _StateType.TOOL_CALL
+            and self.state.is_custom_tool_call
+        ):
+            return emit_simple_custom_tool_call_done(self.state)
         if handlers is None:
             return []
         return handlers.done_fn(self.state)
@@ -1244,6 +1460,13 @@ class SimpleStreamingEventProcessor:
                 tool_call.function.name,
                 tool_call_name_map=self.tool_call_name_map,
             )
+            if tool_call.function.name in self.custom_tool_names:
+                return emit_simple_custom_tool_call_open(
+                    self.state,
+                    call_name.name,
+                    tool_call.index,
+                    call_name.namespace,
+                )
             return handlers.open_fn(
                 self.state,
                 call_name.name,
@@ -1270,9 +1493,13 @@ class SimpleStreamingEventProcessor:
             for tc in delta_message.tool_calls:
                 if tc.function is not None and tc.function.arguments:
                     combined_args += tc.function.arguments
-            if combined_args:
-                return handlers.delta_fn(self.state, combined_args)
-            return []
+            if not combined_args:
+                return []
+            if self.state.is_custom_tool_call:
+                return emit_simple_custom_tool_call_delta(
+                    self.state, combined_args
+                )
+            return handlers.delta_fn(self.state, combined_args)
         elif self.state.current_state == _StateType.REASONING:
             assert delta_message.reasoning is not None
             return handlers.delta_fn(self.state, delta_message.reasoning)
