@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
+import pytest
+
 from vllm.entrypoints.openai.engine.protocol import (
     DeltaFunctionCall,
     DeltaMessage,
@@ -9,6 +13,7 @@ from vllm.entrypoints.openai.engine.protocol import (
 from vllm.entrypoints.openai.responses.streaming_events import (
     SimpleStreamingEventProcessor,
     _StateType,
+    _decode_custom_input_prefix,
     split_delta,
 )
 
@@ -124,3 +129,63 @@ class TestProcessorCompoundDeltas:
         types = [e.type for e in events]
         assert "response.reasoning_text.delta" in types
         assert "response.output_text.delta" in types
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ('{"input":"hello"}', "hello"),
+        (' { "input" : "hello" }', "hello"),
+        ('{"input":"line\\nquote\\\""}', 'line\nquote"'),
+        ('{"input":"\\u4f60\\u597d"}', "你好"),
+        ('{"input":"\\ud83d\\ude00"}', "😀"),
+        ('{"input":"partial\\', "partial"),
+        ('{"input":"\\u4f', ""),
+    ],
+)
+def test_decode_custom_input_prefix(raw: str, expected: str):
+    assert _decode_custom_input_prefix(raw) == expected
+
+
+def test_custom_tool_stream_deltas_match_done_input():
+    tool = SimpleNamespace(type="custom", name="apply_patch")
+    processor = SimpleStreamingEventProcessor(tools=[tool])
+    chunks = ['{"in', 'put"', ':', '"hello\\', 'nworld"}']
+
+    events = []
+    for index, chunk in enumerate(chunks):
+        events.extend(
+            _run_through_processor(
+                processor,
+                DeltaMessage(
+                    tool_calls=[
+                        _make_tool_call(
+                            0,
+                            name="apply_patch" if index == 0 else None,
+                            arguments=chunk,
+                        )
+                    ]
+                ),
+            )
+        )
+    events.extend(processor.close_current())
+
+    deltas = [
+        event.delta
+        for event in events
+        if event.type == "response.custom_tool_call_input.delta"
+    ]
+    done = next(
+        event
+        for event in events
+        if event.type == "response.custom_tool_call_input.done"
+    )
+    output_item = next(
+        event.item
+        for event in events
+        if event.type == "response.output_item.done"
+    )
+
+    assert "".join(deltas) == "hello\nworld"
+    assert done.input == "hello\nworld"
+    assert output_item.input == "hello\nworld"
