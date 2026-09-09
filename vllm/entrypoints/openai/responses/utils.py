@@ -34,8 +34,11 @@ from openai.types.responses.tool import Tool
 
 from vllm import envs
 from vllm.entrypoints.chat_utils import make_tool_call_id
-from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionMessageParam
-from vllm.entrypoints.openai.engine.protocol import FunctionCall
+from vllm.entrypoints.openai.chat_completion.protocol import (
+    ChatCompletionMessageParam,
+    ChatCompletionToolsParam,
+)
+from vllm.entrypoints.openai.engine.protocol import FunctionCall, FunctionDefinition
 from vllm.entrypoints.openai.responses.protocol import ResponseInputOutputItem
 from vllm.logger import init_logger
 from vllm.tool_parsers.utils import (
@@ -97,11 +100,8 @@ def build_response_output_items(
                 tool_call.name, tool_call_name_map=tool_call_name_map
             )
             if call_name.name in custom_tool_names:
-                # The tool was originally declared as a custom (freeform) tool.
-                # On the input side its freeform input was wrapped as
-                # `{"input": <original>}` (JSON) so it could pass through the
-                # chat completions pipeline.  Unwrap it back to the native
-                # custom tool call form here.
+                # 该工具原声明为 custom（自由文本）。输入侧把自由文本封装为
+                # {"input": <original>} (JSON)，此处对称解包还原为原生 custom 形态。
                 try:
                     raw_args = json.loads(tool_call.arguments)
                     input_raw = raw_args.get("input", tool_call.arguments)
@@ -277,9 +277,7 @@ def _construct_message_from_response_item(
     elif isinstance(item, ResponseCustomToolCall) or (
         isinstance(item, dict) and item.get("type") == "custom_tool_call"
     ):
-        # Handle both pydantic model (ResponseCustomToolCall) and dict
-        # (ResponseCustomToolCallParam) forms that Pydantic may produce
-        # when parsing the responses input union.
+        # 兼容 Pydantic 模型（ResponseCustomToolCall）与 dict（...Param）两种形态。
         call_id = (
             item.call_id
             if isinstance(item, ResponseCustomToolCall)
@@ -295,10 +293,8 @@ def _construct_message_from_response_item(
             if isinstance(item, ResponseCustomToolCall)
             else item.get("input")
         )
-        # The downstream chat completions pipeline only supports assistant
-        # tool_calls of type "function".  Wrap the freeform input as a
-        # JSON-encapsulated string so the JSON parser stays clean on the
-        # next turn and the chat template can render it correctly.
+        # 下游 chat completions 管线仅支持 type="function" 的 assistant tool_call。
+        # 把自由文本封装为 {"input": ...} 合法 JSON，保证下一轮 JSON 解析干净。
         tool_call = ChatCompletionMessageToolCallParam(
             id=call_id,
             function=FunctionCallTool(
@@ -308,8 +304,7 @@ def _construct_message_from_response_item(
             type="function",
         )
 
-    # Merge the tool call into the previous assistant message when possible.
-    # The merging logic is shared between function calls and custom tool calls.
+    # function 与 custom 共用合并入口：尝试并入前一条 assistant 消息。
     if tool_call is not None:
         if prev_assistant_msg:
             tool_calls = prev_assistant_msg.get("tool_calls")
@@ -330,7 +325,7 @@ def _construct_message_from_response_item(
                 "Previous assistant message has unknown tool_calls format. "
                 "Tool call merging is skipped and a new assistant message is created. "
                 "Item %s",
-                item.id,
+                getattr(item, "id", None),
             )
         return ChatCompletionAssistantMessageParam(
             role="assistant",
@@ -375,22 +370,18 @@ def _construct_message_from_response_item(
         item,
         (ResponseFunctionToolCallOutputItem, ResponseCustomToolCallOutputItem),
     ):
+        # custom_tool_call_output 也是 tool 消息，统一走工具结果分支。
         return ChatCompletionToolMessageParam(
             role="tool",
             content=item.output,
             tool_call_id=item.call_id,
         )
-    elif isinstance(item, dict) and item.get("type") == "custom_tool_call_output":
-        # dict/TypedDict form of the custom tool call output: Pydantic may
-        # parse the input item as ResponseCustomToolCallOutputParam (dict)
-        # instead of the ResponseCustomToolCallOutputItem model.
-        return ChatCompletionToolMessageParam(
-            role="tool",
-            content=item.get("output"),
-            tool_call_id=item.get("call_id"),
-        )
-    elif isinstance(item, dict) and item.get("type") == "function_call_output":
-        # Append the function call output as a tool message.
+    elif isinstance(item, dict) and item.get("type") in (
+        "function_call_output",
+        "custom_tool_call_output",
+    ):
+        # dict/TypedDict 形态的工具输出：Pydantic 可能解析为
+        # ResponseXxxToolCallOutputParam (dict) 而非对应 model。
         return ChatCompletionToolMessageParam(
             role="tool",
             content=item.get("output"),
@@ -429,9 +420,8 @@ def extract_function_tool_names(tools: list[Tool]) -> frozenset[str]:
 
 def extract_custom_tool_names(tools: list[Tool] | None) -> frozenset[str]:
     """
-    Extracts the names of custom (freeform, no JSON Schema) tools from the
-    tool list.  These are the tools whose Responses output items must be
-    returned as ``ResponseCustomToolCall`` instead of function calls.
+    收集 custom（自由文本、无 JSON Schema）工具名（含 namespace 内嵌套的 custom）。
+    这些工具的 Responses 输出项必须还原为 ResponseCustomToolCall，而非 function call。
     """
     names = []
     if tools:
@@ -464,70 +454,73 @@ def extract_tool_types(tools: list[Tool]) -> set[str]:
     return tool_types
 
 
-def convert_tool_responses_to_completions_format(tool: dict) -> dict:
+def convert_tool_responses_to_completions_format(
+    tool: dict,
+) -> ChatCompletionToolsParam:
     """
-    Convert a flat tool schema:
+    Convert a flat Responses tool schema:
         {"type": "function", "name": "...", "description": "...", "parameters": {...}}
-    into:
-        {"type": "function", "function": {...}}
+    into a Chat Completions tool param for chat-template rendering.
     """
-    return {
-        "type": "function",
-        "function": tool,
-    }
+    return ChatCompletionToolsParam(
+        type="function",
+        function=FunctionDefinition.model_validate(
+            {k: v for k, v in tool.items() if k != "type"}
+        ),
+    )
 
 
 def convert_custom_tool_responses_to_completions_format(
     tool: Tool,
-) -> dict[str, Any]:
-    """
-    Convert a custom (freeform) Responses tool into a Chat Completions
-    function tool so the model can emit tool calls for it.
+) -> ChatCompletionToolsParam:
+    """将 custom（自由文本）Responses 工具转换为 Chat Completions function 工具，
+    使模型能够发起调用。
 
-    The freeform input is exposed as a single JSON ``input`` field, which
-    keeps the model output parseable by the shared function-call tool parser
-    and allows the output side to unwrap it back to the native custom tool
-    call form (see ``build_response_output_items``).
+    自由文本输入对外暴露为单个 JSON ''input'' 字段，既让共享函数式工具解析器
+    可解析模型输出，也让输出侧能解包还原成原生 custom 形态。
     """
-    return {
-        "type": "function",
-        "function": {
-            "name": tool.name,
-            "description": getattr(tool, "description", None)
-            or "Custom tool (freeform input).",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "input": {
-                        "type": "string",
-                        "description": "Freeform input for the custom tool.",
-                    }
+    return ChatCompletionToolsParam(
+        type="function",
+        function=FunctionDefinition.model_validate(
+            {
+                "name": tool.name,
+                "description": getattr(tool, "description", None)
+                or "Custom tool (freeform input).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "input": {
+                            "type": "string",
+                            "description": "Freeform input for the custom tool.",
+                        }
+                    },
+                    "required": ["input"],
                 },
-                "required": ["input"],
-            },
-        },
-    }
+            }
+        ),
+    )
 
 
 def construct_tool_dicts(
-    tools: list[Tool], tool_choice: ToolChoice
+    tools: list[Tool],
+    tool_choice: ToolChoice,
+    exclude_tools_when_tool_choice_none: bool = False,
 ) -> list[dict[str, Any]] | None:
-    if not tools or (tool_choice == "none"):
-        tool_dicts = None
-    else:
-        tool_dicts = [
-            convert_tool_responses_to_completions_format(tool)
-            for tool in iter_response_function_tool_dicts(tools)
-        ]
-        # Custom (freeform) tools have no JSON Schema, but the downstream
-        # chat completions pipeline requires function-shaped tool definitions.
-        # Convert them so the model can produce tool calls; the output side
-        # will unwrap them back to the native custom form.
-        tool_dicts.extend(
-            convert_custom_tool_responses_to_completions_format(tool)
-            for tool in tools
-            if tool.type == "custom"
-        )
+    if not tools or (tool_choice == "none" and exclude_tools_when_tool_choice_none):
+        return None
+    tool_dicts = [
+        convert_tool_responses_to_completions_format(tool).model_dump()
+        for tool in iter_response_function_tool_dicts(tools)
+    ]
+    # custom（自由文本）工具没有 JSON Schema，但下游 chat completions 管线要求
+    # function 形定义。注意：iter_response_function_tool_dicts 只收集 function /
+    # namespace 内 function（isinstance(FunctionTool) 过滤），不会把 custom 当作
+    # function 产出；这里仅对 type=="custom" 单独补齐一次，与上面互斥、不重复。
+    tool_dicts.extend(
+        convert_custom_tool_responses_to_completions_format(tool).model_dump()
+        for tool in tools
+        if tool.type == "custom"
+    )
     return tool_dicts
 
  
