@@ -203,6 +203,20 @@ class ResponsesRequest(OpenAIBaseModel):
     )
 
     # --8<-- [start:responses-extra-params]
+    use_incremental_token: bool = Field(
+        default=False,
+        description=(
+            "Reuse the tokenized history associated with x-session-id. "
+            "When the history is unavailable, the request fails with HTTP 500."
+        ),
+    )
+    use_store: bool = Field(
+        default=False,
+        description=(
+            "Save this request's newly added token IDs to the Responses "
+            "session store after generation completes."
+        ),
+    )
     request_id: str = Field(
         default_factory=lambda: f"resp_{random_uuid()}",
         description=(
