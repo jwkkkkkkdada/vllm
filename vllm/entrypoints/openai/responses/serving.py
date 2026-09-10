@@ -1799,24 +1799,3 @@ class OpenAIServingResponses(GenerateBaseServing):
                     response=final_response,
                 )
             )
-    async def delete_response_session(
-        self,
-        session_id: str,
-        raw_request: Request,
-    ) -> bool:
-        store = self._resolve_session_store(raw_request)
-        if store is None:
-            return False
-        return await store.delete(session_id)
-
-
-    async def get_response_session(
-            self,
-            session_id: str,
-            raw_request: Request,
-        ) -> bool:
-            store = self._resolve_session_store(raw_request)
-            if store is None:
-                return False
-
-            return await store.exists(session_id)
