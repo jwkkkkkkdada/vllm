@@ -34,17 +34,17 @@ class ResponsesStoreOptions:
 
     enabled: bool = False
     disk_enabled: bool = True
-    memory_capacity_mb: int = 512
-    disk_capacity_mb: int = 4096
-    memory_low_watermark: float = 0.6
+    memory_capacity_mb: int = 1024
+    disk_capacity_mb: int = 10240
+    memory_low_watermark: float = 0.4
     memory_high_watermark: float = 0.8
-    disk_low_watermark: float = 0.7
+    disk_low_watermark: float = 0.4
     disk_high_watermark: float = 0.9
-    memory_ttl_seconds: int = 300
-    disk_ttl_seconds: int = 3600
-    cleanup_interval_seconds: float = 30.0
-    cleanup_max_candidates: int = 128
-    cleanup_max_bytes_mb: int = 512
+    memory_ttl_seconds: int = 1800
+    disk_ttl_seconds: int = 36000
+    cleanup_interval_seconds: float = 300.0
+    cleanup_max_candidates: int = 256
+    cleanup_max_bytes_mb: int = 2048
     num_shards: int = 64
     disk_write_interval_seconds: float = 0.05
 
